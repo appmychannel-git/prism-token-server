@@ -1,0 +1,18 @@
+# Render 배포 설정 (Blueprint)
+# Render 대시보드에서 "New > Blueprint"로 이 저장소를 연결하면 자동 인식됩니다.
+services:
+  - type: web
+    name: prism-token-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      # 값은 파일에 두지 않고 Render 대시보드에서 직접 입력(보안)
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
