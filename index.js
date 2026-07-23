@@ -58,33 +58,43 @@ const server = http.createServer(async (req, res) => {
   // 같은 identity로 재접속하면 서버가 이전 세션을 즉시 교체 → 유령 참가자 방지.
   const identity = url.searchParams.get('identity') || name;
   const pin = (url.searchParams.get('pin') || '').trim();
+  const isCreate = url.searchParams.get('create') === 'true'; // 방 만들기 여부
 
-  // ---- 비공개 방(입장코드) 검증 ----
-  // 코드는 LiveKit 방 메타데이터에 저장. 방이 이미 비공개면 pin 일치해야 입장.
-  // 방이 아직 없고 pin이 오면 → 비공개 방으로 생성(생성자).
+  // ---- 방 존재 확인 + 비공개(입장코드) 검증 ----
+  // 코드는 LiveKit 방 메타데이터에 저장(별도 DB 불필요).
+  //  - 방 있음 + 비공개 → pin 일치해야 입장
+  //  - 방 없음 + 만들기(create) → (비공개면 메타데이터와 함께) 생성
+  //  - 방 없음 + 참여하기 → 거부(없는 방 입장/자동생성 방지)
   try {
     const found = await roomSvc.listRooms([room]);
     const existing = found && found[0];
-    if (existing && existing.metadata) {
+
+    if (existing) {
       let meta = {};
-      try { meta = JSON.parse(existing.metadata); } catch (_) {}
-      if (meta.private) {
-        if (!pin || pin !== meta.pin) {
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify({ error: '입장 코드가 올바르지 않습니다.' }));
-        }
+      try { meta = JSON.parse(existing.metadata || '{}'); } catch (_) {}
+      if (meta.private && (!pin || pin !== meta.pin)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end(
+          JSON.stringify({ error: '입장 코드가 올바르지 않습니다.' }));
       }
-    } else if (!existing && pin) {
-      // 방이 없고 pin 제공 → 비공개 방 생성
-      await roomSvc.createRoom({
-        name: room,
-        emptyTimeout: 600, // 비면 10분 뒤 삭제(그때까지 코드 유지)
-        metadata: JSON.stringify({ private: true, pin }),
-      });
+    } else {
+      if (isCreate) {
+        // 만들기: 공개/비공개 모두 즉시 생성(참여자가 곧바로 찾을 수 있게)
+        await roomSvc.createRoom({
+          name: room,
+          emptyTimeout: 600, // 비면 10분 뒤 삭제(그때까지 유지)
+          metadata: pin ? JSON.stringify({ private: true, pin }) : '',
+        });
+      } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          error: '존재하지 않는 방이거나 아직 시작되지 않았습니다.',
+        }));
+      }
     }
   } catch (e) {
-    // 방 조회/생성 실패해도 토큰 발급은 진행(안정성 우선, 공개방처럼 동작)
-    console.log('room privacy check error:', e && e.message ? e.message : e);
+    // 방 조회 실패 시 토큰 발급은 진행(안정성 우선)
+    console.log('room check error:', e && e.message ? e.message : e);
   }
 
   try {
