@@ -40,6 +40,32 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: true, serverUrl: LIVEKIT_URL }));
   }
 
+  // 방장이 회의 종료 → 방 삭제(전원 퇴장). 방장 identity 검증.
+  if (url.pathname === '/end') {
+    const room = url.searchParams.get('room') || '';
+    const identity = url.searchParams.get('identity') || '';
+    try {
+      const found = await roomSvc.listRooms([room]);
+      const existing = found && found[0];
+      if (!existing) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: true, note: 'already ended' }));
+      }
+      let meta = {};
+      try { meta = JSON.parse(existing.metadata || '{}'); } catch (_) {}
+      if (meta.host && meta.host !== identity) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: '방장만 종료할 수 있습니다.' }));
+      }
+      await roomSvc.deleteRoom(room);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: String(e) }));
+    }
+  }
+
   if (url.pathname !== '/token') {
     res.writeHead(404);
     return res.end('not found');
@@ -79,11 +105,13 @@ const server = http.createServer(async (req, res) => {
       }
     } else {
       if (isCreate) {
-        // 만들기: 공개/비공개 모두 즉시 생성(참여자가 곧바로 찾을 수 있게)
+        // 만들기: 공개/비공개 모두 즉시 생성. 방장(host)=생성자 identity 저장.
+        const meta = { host: identity };
+        if (pin) { meta.private = true; meta.pin = pin; }
         await roomSvc.createRoom({
           name: room,
           emptyTimeout: 600, // 비면 10분 뒤 삭제(그때까지 유지)
-          metadata: pin ? JSON.stringify({ private: true, pin }) : '',
+          metadata: JSON.stringify(meta),
         });
       } else {
         res.writeHead(404, { 'Content-Type': 'application/json' });
