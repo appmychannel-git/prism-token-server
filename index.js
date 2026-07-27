@@ -96,6 +96,14 @@ const server = http.createServer(async (req, res) => {
     const existing = found && found[0];
 
     if (existing) {
+      // 만들기(create)인데 같은 이름의 방이 이미 있으면 → 이름 중복 거부.
+      // (두 번째 생성자가 기존 방에 흡수 입장되지 않고, 다른 이름을 쓰도록 안내)
+      if (isCreate) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          error: '이미 사용 중인 방 이름입니다. 다른 이름을 사용하세요.',
+        }));
+      }
       let meta = {};
       try { meta = JSON.parse(existing.metadata || '{}'); } catch (_) {}
       if (meta.private && (!pin || pin !== meta.pin)) {
