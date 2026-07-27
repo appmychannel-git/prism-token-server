@@ -18,6 +18,9 @@ const LIVEKIT_URL = process.env.LIVEKIT_URL || 'wss://YOUR-PROJECT.livekit.cloud
 const API_KEY = process.env.LIVEKIT_API_KEY || '';
 const API_SECRET = process.env.LIVEKIT_API_SECRET || '';
 const PORT = Number(process.env.PORT || 3000);
+// 방 최대 유지 시간(초). 데모: 생성 1시간 뒤 자동 종료. 0이면 무제한.
+// 나중에 회원 차등 시 방마다 다른 값을 메타데이터에 저장하면 됨.
+const ROOM_MAX_SEC = Number(process.env.ROOM_MAX_SEC || 3600);
 
 // 비공개 방 입장코드 검증용. 코드는 LiveKit "방 메타데이터"에 저장 → 별도 DB 불필요.
 const HTTP_URL = LIVEKIT_URL.replace('wss://', 'https://').replace('ws://', 'http://');
@@ -114,7 +117,9 @@ const server = http.createServer(async (req, res) => {
     } else {
       if (isCreate) {
         // 만들기: 공개/비공개 모두 즉시 생성. 방장(host)=생성자 identity 저장.
-        const meta = { host: identity };
+        // createdAt + maxDurationSec: 최대 유지시간 초과 시 sweeper가 자동 종료.
+        const meta = { host: identity, createdAt: Math.floor(Date.now() / 1000) };
+        if (ROOM_MAX_SEC > 0) meta.maxDurationSec = ROOM_MAX_SEC;
         if (pin) { meta.private = true; meta.pin = pin; }
         await roomSvc.createRoom({
           name: room,
@@ -154,6 +159,28 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: String(e) }));
   }
 });
+
+// 방 최대 유지시간 sweeper: 1분마다 방을 훑어 생성 후 maxDurationSec 초과분을 삭제.
+// 생성시각(메타 createdAt) 기준이라 서버 재시작에도 안전.
+setInterval(async () => {
+  try {
+    const rooms = await roomSvc.listRooms();
+    const now = Math.floor(Date.now() / 1000);
+    for (const r of rooms) {
+      let meta = {};
+      try { meta = JSON.parse(r.metadata || '{}'); } catch (_) {}
+      if (meta.maxDurationSec && meta.createdAt &&
+          (now - meta.createdAt) >= meta.maxDurationSec) {
+        try {
+          await roomSvc.deleteRoom(r.name);
+          console.log('auto-closed (time limit):', r.name);
+        } catch (_) {}
+      }
+    }
+  } catch (e) {
+    console.log('sweep error:', e && e.message ? e.message : e);
+  }
+}, 60 * 1000);
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[prism-token-server] listening on :${PORT}`);
