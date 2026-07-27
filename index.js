@@ -18,9 +18,26 @@ const LIVEKIT_URL = process.env.LIVEKIT_URL || 'wss://YOUR-PROJECT.livekit.cloud
 const API_KEY = process.env.LIVEKIT_API_KEY || '';
 const API_SECRET = process.env.LIVEKIT_API_SECRET || '';
 const PORT = Number(process.env.PORT || 3000);
+// ---- 방 정책값 (env로 조절 가능) ----
 // 방 최대 유지 시간(초). 데모: 생성 1시간 뒤 자동 종료. 0이면 무제한.
 // 나중에 회원 차등 시 방마다 다른 값을 메타데이터에 저장하면 됨.
 const ROOM_MAX_SEC = Number(process.env.ROOM_MAX_SEC || 3600);
+// 방 생성 후 아무도 안 들어오면 종료(초). 기본 10분.
+const EMPTY_SEC = Number(process.env.EMPTY_SEC || 600);
+// 방 종료 후 이 시간 동안은 "원래 방장"만 같은 이름으로 재생성 가능(초). 기본 3분.
+const RESERVE_SEC = Number(process.env.RESERVE_SEC || 180);
+// sweeper 주기(초). 기본 3분.
+const SWEEP_SEC = Number(process.env.SWEEP_SEC || 180);
+
+// 최근 종료된 방 예약: roomName -> { host, endedAt }.
+// 종료 후 RESERVE_SEC 동안 원래 방장(host identity)만 같은 이름 재생성 가능.
+// (메모리 보관 → 서버 재시작 시 초기화됨. 짧은 창이라 영향 미미.)
+const recentlyEnded = new Map();
+function markEnded(room, host) {
+  if (room) {
+    recentlyEnded.set(room, { host: host || '', endedAt: Math.floor(Date.now() / 1000) });
+  }
+}
 
 // 비공개 방 입장코드 검증용. 코드는 LiveKit "방 메타데이터"에 저장 → 별도 DB 불필요.
 const HTTP_URL = LIVEKIT_URL.replace('wss://', 'https://').replace('ws://', 'http://');
@@ -61,6 +78,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: '방장만 종료할 수 있습니다.' }));
       }
       await roomSvc.deleteRoom(room);
+      markEnded(room, meta.host || identity); // 종료 후 RESERVE_SEC 동안 방장만 재생성 허용
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ok: true }));
     } catch (e) {
@@ -116,14 +134,26 @@ const server = http.createServer(async (req, res) => {
       }
     } else {
       if (isCreate) {
+        const now = Math.floor(Date.now() / 1000);
+        // 방 종료 후 예약창: RESERVE_SEC 동안은 원래 방장만 같은 이름 재생성 가능.
+        // 다른 사람이 그 이름으로 만들려 하면 잠시 막는다.
+        const rec = recentlyEnded.get(room);
+        if (rec && (now - rec.endedAt) < RESERVE_SEC && rec.host !== identity) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({
+            error: '최근까지 사용된 방 이름입니다. 잠시 후 다시 시도하세요.',
+          }));
+        }
+        recentlyEnded.delete(room); // 재생성되면 예약 해제
+
         // 만들기: 공개/비공개 모두 즉시 생성. 방장(host)=생성자 identity 저장.
         // createdAt + maxDurationSec: 최대 유지시간 초과 시 sweeper가 자동 종료.
-        const meta = { host: identity, createdAt: Math.floor(Date.now() / 1000) };
+        const meta = { host: identity, createdAt: now };
         if (ROOM_MAX_SEC > 0) meta.maxDurationSec = ROOM_MAX_SEC;
         if (pin) { meta.private = true; meta.pin = pin; }
         await roomSvc.createRoom({
           name: room,
-          emptyTimeout: 600, // 비면 10분 뒤 삭제(그때까지 유지)
+          emptyTimeout: EMPTY_SEC, // 아무도 안 들어오면 이 시간 뒤 삭제
           metadata: JSON.stringify(meta),
         });
       } else {
@@ -160,8 +190,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// 방 최대 유지시간 sweeper: 1분마다 방을 훑어 생성 후 maxDurationSec 초과분을 삭제.
-// 생성시각(메타 createdAt) 기준이라 서버 재시작에도 안전.
+// 방 최대 유지시간 sweeper: SWEEP_SEC(기본 3분)마다 방을 훑어
+// 생성 후 maxDurationSec 초과분을 삭제. 생성시각(메타 createdAt) 기준이라 재시작에도 안전.
 setInterval(async () => {
   try {
     const rooms = await roomSvc.listRooms();
@@ -173,14 +203,19 @@ setInterval(async () => {
           (now - meta.createdAt) >= meta.maxDurationSec) {
         try {
           await roomSvc.deleteRoom(r.name);
+          markEnded(r.name, meta.host); // 자동 종료도 예약 대상(방장만 재생성)
           console.log('auto-closed (time limit):', r.name);
         } catch (_) {}
       }
     }
+    // 만료된 예약 정리
+    for (const [nm, rec] of recentlyEnded) {
+      if (now - rec.endedAt >= RESERVE_SEC) recentlyEnded.delete(nm);
+    }
   } catch (e) {
     console.log('sweep error:', e && e.message ? e.message : e);
   }
-}, 60 * 1000);
+}, SWEEP_SEC * 1000);
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[prism-token-server] listening on :${PORT}`);
