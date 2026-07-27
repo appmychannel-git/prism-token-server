@@ -21,9 +21,9 @@ const PORT = Number(process.env.PORT || 3000);
 // ---- 방 정책값 (env로 조절 가능) ----
 // 비회원(게스트) 방 최대 유지 시간(초). 데모: 생성 1시간 뒤 자동 종료. 0이면 무제한.
 const ROOM_MAX_SEC = Number(process.env.ROOM_MAX_SEC || 3600);
-// 회원(로그인) 방 최대 유지 시간(초). 기본 5시간. 0이면 무제한.
+// 회원(로그인) 방 최대 유지 시간(초). 기본 6시간. 0이면 무제한.
 // ⚠️ 무제한(0)은 유휴 참가자가 남은 방이 안 닫혀 비용이 샐 수 있어 비권장.
-const ROOM_MAX_SEC_MEMBER = Number(process.env.ROOM_MAX_SEC_MEMBER || 18000);
+const ROOM_MAX_SEC_MEMBER = Number(process.env.ROOM_MAX_SEC_MEMBER || 21600);
 // 방 생성 후 아무도 안 들어오면 종료(초). 기본 10분.
 const EMPTY_SEC = Number(process.env.EMPTY_SEC || 600);
 // 방 종료 후 이 시간 동안은 "원래 방장"만 같은 이름으로 재생성 가능(초). 기본 3분.
