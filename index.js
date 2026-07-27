@@ -19,9 +19,11 @@ const API_KEY = process.env.LIVEKIT_API_KEY || '';
 const API_SECRET = process.env.LIVEKIT_API_SECRET || '';
 const PORT = Number(process.env.PORT || 3000);
 // ---- 방 정책값 (env로 조절 가능) ----
-// 방 최대 유지 시간(초). 데모: 생성 1시간 뒤 자동 종료. 0이면 무제한.
-// 나중에 회원 차등 시 방마다 다른 값을 메타데이터에 저장하면 됨.
+// 비회원(게스트) 방 최대 유지 시간(초). 데모: 생성 1시간 뒤 자동 종료. 0이면 무제한.
 const ROOM_MAX_SEC = Number(process.env.ROOM_MAX_SEC || 3600);
+// 회원(로그인) 방 최대 유지 시간(초). 기본 5시간. 0이면 무제한.
+// ⚠️ 무제한(0)은 유휴 참가자가 남은 방이 안 닫혀 비용이 샐 수 있어 비권장.
+const ROOM_MAX_SEC_MEMBER = Number(process.env.ROOM_MAX_SEC_MEMBER || 18000);
 // 방 생성 후 아무도 안 들어오면 종료(초). 기본 10분.
 const EMPTY_SEC = Number(process.env.EMPTY_SEC || 600);
 // 방 종료 후 이 시간 동안은 "원래 방장"만 같은 이름으로 재생성 가능(초). 기본 3분.
@@ -146,10 +148,16 @@ const server = http.createServer(async (req, res) => {
         }
         recentlyEnded.delete(room); // 재생성되면 예약 해제
 
+        // 회원/비회원 차등 유지시간.
+        // TODO(로그인): 로그인·회원 검증 붙으면 여기서 isMember 를 판정한다
+        //   (예: 검증된 세션/토큰 확인). 지금은 인증 체계가 없어 전원 게스트 취급.
+        const isMember = false;
+        const maxSec = isMember ? ROOM_MAX_SEC_MEMBER : ROOM_MAX_SEC;
+
         // 만들기: 공개/비공개 모두 즉시 생성. 방장(host)=생성자 identity 저장.
         // createdAt + maxDurationSec: 최대 유지시간 초과 시 sweeper가 자동 종료.
         const meta = { host: identity, createdAt: now };
-        if (ROOM_MAX_SEC > 0) meta.maxDurationSec = ROOM_MAX_SEC;
+        if (maxSec > 0) meta.maxDurationSec = maxSec;
         if (pin) { meta.private = true; meta.pin = pin; }
         await roomSvc.createRoom({
           name: room,
