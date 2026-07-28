@@ -31,6 +31,35 @@ const RESERVE_SEC = Number(process.env.RESERVE_SEC || 180);
 // sweeper 주기(초). 기본 3분.
 const SWEEP_SEC = Number(process.env.SWEEP_SEC || 180);
 
+// ---- 채팅 번역(Google Cloud Translation v2 Basic, API 키 방식) ----
+// Google Cloud 프로젝트에서 "Cloud Translation API" 사용 설정 후 만든 API 키를
+// Render 환경변수 GOOGLE_TRANSLATE_API_KEY 로 넣는다. (서비스계정 JSON 불필요)
+const GOOGLE_TRANSLATE_API_KEY = process.env.GOOGLE_TRANSLATE_API_KEY || '';
+// 한 번에 번역할 최대 글자 수(남용/비용 방지). 채팅 한 줄엔 충분.
+const TRANSLATE_MAX_CHARS = Number(process.env.TRANSLATE_MAX_CHARS || 2000);
+// 번역 결과 메모리 캐시(같은 문장 재요청 시 Google 재호출/과금 방지).
+const _trCache = new Map(); // key: `${source}|${target}|${text}` -> {translatedText, detectedSourceLanguage}
+const TRANSLATE_CACHE_MAX = 5000;
+function _trCacheSet(key, val) {
+  _trCache.set(key, val);
+  if (_trCache.size > TRANSLATE_CACHE_MAX) {
+    // 가장 오래된 항목부터 제거(Map은 삽입순 보존)
+    _trCache.delete(_trCache.keys().next().value);
+  }
+}
+// POST 본문(JSON) 읽기 헬퍼.
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (c) => {
+      data += c;
+      if (data.length > 100000) req.destroy(); // 과대 본문 차단
+    });
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
+}
+
 // 최근 종료된 방 예약: roomName -> { host, endedAt }.
 // 종료 후 RESERVE_SEC 동안 원래 방장(host identity)만 같은 이름 재생성 가능.
 // (메모리 보관 → 서버 재시작 시 초기화됨. 짧은 창이라 영향 미미.)
@@ -49,7 +78,7 @@ const server = http.createServer(async (req, res) => {
   // 웹(Flutter web)에서 fetch 가능하도록 CORS 허용
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     return res.end();
@@ -60,6 +89,77 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, serverUrl: LIVEKIT_URL }));
+  }
+
+  // 채팅 번역: POST /translate  body={text, target, source?} → {translatedText, detectedSourceLanguage}
+  // 각 클라이언트가 수신 메시지를 자기 선호 언어로 "탭 번역"할 때 호출.
+  if (url.pathname === '/translate') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'POST 로 호출하세요.' }));
+    }
+    if (!GOOGLE_TRANSLATE_API_KEY) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        error: 'GOOGLE_TRANSLATE_API_KEY 가 설정되지 않았습니다.',
+      }));
+    }
+    let body = {};
+    try {
+      body = JSON.parse((await readBody(req)) || '{}');
+    } catch (_) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '잘못된 요청 본문(JSON) 입니다.' }));
+    }
+    const text = (body.text || '').toString();
+    const target = (body.target || '').toString();
+    const source = (body.source || '').toString();
+    if (!text || !target) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'text, target 는 필수입니다.' }));
+    }
+    if (text.length > TRANSLATE_MAX_CHARS) {
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '번역 가능한 길이를 초과했습니다.' }));
+    }
+    const cacheKey = `${source}|${target}|${text}`;
+    if (_trCache.has(cacheKey)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(_trCache.get(cacheKey)));
+    }
+    try {
+      const gRes = await fetch(
+        `https://translation.googleapis.com/language/translate/v2?key=${GOOGLE_TRANSLATE_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            q: text,
+            target,
+            source: source || undefined, // 없으면 Google 이 자동 감지
+            format: 'text',
+          }),
+        },
+      );
+      const gJson = await gRes.json();
+      if (!gRes.ok) {
+        const msg = gJson && gJson.error && gJson.error.message
+          ? gJson.error.message : `Google 오류 (${gRes.status})`;
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: msg }));
+      }
+      const tr = gJson.data.translations[0];
+      const out = {
+        translatedText: tr.translatedText,
+        detectedSourceLanguage: tr.detectedSourceLanguage || source || '',
+      };
+      _trCacheSet(cacheKey, out);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(out));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '번역 서버 호출 실패: ' + String(e) }));
+    }
   }
 
   // 방장이 회의 종료 → 방 삭제(전원 퇴장). 방장 identity 검증.
@@ -229,5 +329,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[prism-token-server] listening on :${PORT}`);
   console.log(`  LIVEKIT_URL = ${LIVEKIT_URL}`);
   console.log(`  API key set = ${API_KEY ? 'yes' : 'NO (토큰 발급 불가)'}`);
-  console.log(`  엔드포인트  = GET /token?room=<방>&name=<이름>`);
+  console.log(`  번역 key set = ${GOOGLE_TRANSLATE_API_KEY ? 'yes' : 'NO (/translate 비활성)'}`);
+  console.log(`  엔드포인트  = GET /token?room=<방>&name=<이름>  |  POST /translate {text,target}`);
 });
