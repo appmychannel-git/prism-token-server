@@ -40,6 +40,10 @@ const AZURE_TRANSLATE_KEY = process.env.AZURE_TRANSLATE_KEY || '';
 const AZURE_TRANSLATE_REGION = process.env.AZURE_TRANSLATE_REGION || '';
 const AZURE_TRANSLATE_ENDPOINT = (process.env.AZURE_TRANSLATE_ENDPOINT ||
   'https://api.cognitive.microsofttranslator.com').replace(/\/+$/, '');
+// 이 배포의 기본 번역 엔진: 'google'(기본) | 'azure'.
+// 거래처별 토큰서버를 따로 띄울 때 이 값만 바꾸면 앱 수정 없이 엔진이 갈린다.
+// (예: 카자흐스탄 서버 TRANSLATE_PROVIDER=azure, 르완다 서버=google)
+const TRANSLATE_PROVIDER = (process.env.TRANSLATE_PROVIDER || 'google').toLowerCase();
 // 한 번에 번역할 최대 글자 수(남용/비용 방지). 채팅 한 줄엔 충분.
 const TRANSLATE_MAX_CHARS = Number(process.env.TRANSLATE_MAX_CHARS || 2000);
 // 번역 결과 메모리 캐시(같은 문장 재요청 시 Google 재호출/과금 방지).
@@ -113,8 +117,9 @@ const server = http.createServer(async (req, res) => {
     const text = (body.text || '').toString();
     const target = (body.target || '').toString();
     const source = (body.source || '').toString();
-    // provider: 'google'(기본) | 'azure'. 앱은 미지정→google 그대로.
-    const provider = (body.provider || 'google').toString().toLowerCase();
+    // provider: 요청 지정값 우선, 없으면 이 배포의 기본 엔진(TRANSLATE_PROVIDER).
+    const provider = (body.provider || TRANSLATE_PROVIDER || 'google')
+      .toString().toLowerCase();
     if (!text || !target) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: 'text, target 는 필수입니다.' }));
@@ -368,5 +373,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  API key set = ${API_KEY ? 'yes' : 'NO (토큰 발급 불가)'}`);
   console.log(`  번역 key set = ${GOOGLE_TRANSLATE_API_KEY ? 'yes' : 'NO (/translate 비활성)'}`);
   console.log(`  Azure 번역 = ${AZURE_TRANSLATE_KEY ? `yes (${AZURE_TRANSLATE_REGION})` : 'NO (provider=azure 비활성)'}`);
+  console.log(`  기본 엔진   = ${TRANSLATE_PROVIDER}`);
   console.log(`  엔드포인트  = GET /token?room=<방>&name=<이름>  |  POST /translate {text,target}`);
 });
