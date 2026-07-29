@@ -35,6 +35,11 @@ const SWEEP_SEC = Number(process.env.SWEEP_SEC || 180);
 // Google Cloud 프로젝트에서 "Cloud Translation API" 사용 설정 후 만든 API 키를
 // Render 환경변수 GOOGLE_TRANSLATE_API_KEY 로 넣는다. (서비스계정 JSON 불필요)
 const GOOGLE_TRANSLATE_API_KEY = process.env.GOOGLE_TRANSLATE_API_KEY || '';
+// Azure Translator(품질 비교/대안용). provider=azure 로 호출 시 사용.
+const AZURE_TRANSLATE_KEY = process.env.AZURE_TRANSLATE_KEY || '';
+const AZURE_TRANSLATE_REGION = process.env.AZURE_TRANSLATE_REGION || '';
+const AZURE_TRANSLATE_ENDPOINT = (process.env.AZURE_TRANSLATE_ENDPOINT ||
+  'https://api.cognitive.microsofttranslator.com').replace(/\/+$/, '');
 // 한 번에 번역할 최대 글자 수(남용/비용 방지). 채팅 한 줄엔 충분.
 const TRANSLATE_MAX_CHARS = Number(process.env.TRANSLATE_MAX_CHARS || 2000);
 // 번역 결과 메모리 캐시(같은 문장 재요청 시 Google 재호출/과금 방지).
@@ -98,12 +103,6 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(405, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: 'POST 로 호출하세요.' }));
     }
-    if (!GOOGLE_TRANSLATE_API_KEY) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({
-        error: 'GOOGLE_TRANSLATE_API_KEY 가 설정되지 않았습니다.',
-      }));
-    }
     let body = {};
     try {
       body = JSON.parse((await readBody(req)) || '{}');
@@ -114,6 +113,8 @@ const server = http.createServer(async (req, res) => {
     const text = (body.text || '').toString();
     const target = (body.target || '').toString();
     const source = (body.source || '').toString();
+    // provider: 'google'(기본) | 'azure'. 앱은 미지정→google 그대로.
+    const provider = (body.provider || 'google').toString().toLowerCase();
     if (!text || !target) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: 'text, target 는 필수입니다.' }));
@@ -122,37 +123,73 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(413, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: '번역 가능한 길이를 초과했습니다.' }));
     }
-    const cacheKey = `${source}|${target}|${text}`;
+    const cacheKey = `${provider}|${source}|${target}|${text}`;
     if (_trCache.has(cacheKey)) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify(_trCache.get(cacheKey)));
     }
     try {
-      const gRes = await fetch(
-        `https://translation.googleapis.com/language/translate/v2?key=${GOOGLE_TRANSLATE_API_KEY}`,
-        {
+      let out;
+      if (provider === 'azure') {
+        if (!AZURE_TRANSLATE_KEY) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'AZURE_TRANSLATE_KEY 가 설정되지 않았습니다.' }));
+        }
+        const qs = new URLSearchParams({ 'api-version': '3.0', to: target });
+        if (source) qs.set('from', source);
+        const aRes = await fetch(`${AZURE_TRANSLATE_ENDPOINT}/translate?${qs}`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            q: text,
-            target,
-            source: source || undefined, // 없으면 Google 이 자동 감지
-            format: 'text',
-          }),
-        },
-      );
-      const gJson = await gRes.json();
-      if (!gRes.ok) {
-        const msg = gJson && gJson.error && gJson.error.message
-          ? gJson.error.message : `Google 오류 (${gRes.status})`;
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: msg }));
+          headers: {
+            'Ocp-Apim-Subscription-Key': AZURE_TRANSLATE_KEY,
+            'Ocp-Apim-Subscription-Region': AZURE_TRANSLATE_REGION,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify([{ Text: text }]),
+        });
+        const aJson = await aRes.json();
+        if (!aRes.ok) {
+          const msg = aJson && aJson.error && aJson.error.message
+            ? aJson.error.message : `Azure 오류 (${aRes.status})`;
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: msg }));
+        }
+        const r0 = aJson[0];
+        out = {
+          translatedText: r0.translations[0].text,
+          detectedSourceLanguage:
+            (r0.detectedLanguage && r0.detectedLanguage.language) || source || '',
+        };
+      } else {
+        if (!GOOGLE_TRANSLATE_API_KEY) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'GOOGLE_TRANSLATE_API_KEY 가 설정되지 않았습니다.' }));
+        }
+        const gRes = await fetch(
+          `https://translation.googleapis.com/language/translate/v2?key=${GOOGLE_TRANSLATE_API_KEY}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              q: text,
+              target,
+              source: source || undefined, // 없으면 Google 이 자동 감지
+              format: 'text',
+            }),
+          },
+        );
+        const gJson = await gRes.json();
+        if (!gRes.ok) {
+          const msg = gJson && gJson.error && gJson.error.message
+            ? gJson.error.message : `Google 오류 (${gRes.status})`;
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: msg }));
+        }
+        const tr = gJson.data.translations[0];
+        out = {
+          translatedText: tr.translatedText,
+          detectedSourceLanguage: tr.detectedSourceLanguage || source || '',
+        };
       }
-      const tr = gJson.data.translations[0];
-      const out = {
-        translatedText: tr.translatedText,
-        detectedSourceLanguage: tr.detectedSourceLanguage || source || '',
-      };
       _trCacheSet(cacheKey, out);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify(out));
@@ -330,5 +367,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  LIVEKIT_URL = ${LIVEKIT_URL}`);
   console.log(`  API key set = ${API_KEY ? 'yes' : 'NO (토큰 발급 불가)'}`);
   console.log(`  번역 key set = ${GOOGLE_TRANSLATE_API_KEY ? 'yes' : 'NO (/translate 비활성)'}`);
+  console.log(`  Azure 번역 = ${AZURE_TRANSLATE_KEY ? `yes (${AZURE_TRANSLATE_REGION})` : 'NO (provider=azure 비활성)'}`);
   console.log(`  엔드포인트  = GET /token?room=<방>&name=<이름>  |  POST /translate {text,target}`);
 });
