@@ -83,6 +83,23 @@ function markEnded(room, host) {
 const HTTP_URL = LIVEKIT_URL.replace('wss://', 'https://').replace('ws://', 'http://');
 const roomSvc = new RoomServiceClient(HTTP_URL, API_KEY, API_SECRET);
 
+// ---- Firebase Admin (통화 수신벨 FCM 전송용) ----
+// Render 환경변수 FIREBASE_SERVICE_ACCOUNT 에 서비스계정 JSON 전체를 넣는다.
+// 값이 없으면 /call 만 비활성 — 기존 /token, /translate 는 영향 없음.
+let fbMessaging = null;
+let fbFirestore = null;
+try {
+  const rawSa = process.env.FIREBASE_SERVICE_ACCOUNT || '';
+  if (rawSa) {
+    const admin = require('firebase-admin');
+    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(rawSa)) });
+    fbMessaging = admin.messaging();
+    fbFirestore = admin.firestore();
+  }
+} catch (e) {
+  console.log('firebase-admin init failed:', e && e.message ? e.message : e);
+}
+
 const server = http.createServer(async (req, res) => {
   // 웹(Flutter web)에서 fetch 가능하도록 CORS 허용
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -231,6 +248,71 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // 통화 벨: POST /call  body={callId, fromUuid, fromName, toUuid, room, video}
+  // 상대(toUuid) 기기 FCM 토큰을 Firestore(devices/{uuid})에서 읽어 수신 푸시를 보낸다.
+  if (url.pathname === '/call') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'POST 로 호출하세요.' }));
+    }
+    if (!fbMessaging || !fbFirestore) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        error: 'FCM 미설정(FIREBASE_SERVICE_ACCOUNT).',
+      }));
+    }
+    let body = {};
+    try {
+      body = JSON.parse((await readBody(req)) || '{}');
+    } catch (_) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '잘못된 요청 본문(JSON) 입니다.' }));
+    }
+    const callId = (body.callId || '').toString();
+    const toUuid = (body.toUuid || '').toString();
+    const room = (body.room || '').toString();
+    const fromName = (body.fromName || '').toString();
+    const fromUuid = (body.fromUuid || '').toString();
+    const video = body.video === true || body.video === 'true';
+    if (!callId || !toUuid || !room) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'callId, toUuid, room 은 필수입니다.' }));
+    }
+    try {
+      const snap = await fbFirestore.collection('devices').doc(toUuid).get();
+      const token = snap.exists ? snap.get('fcmToken') : null;
+      if (!token) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          error: '상대 기기를 찾을 수 없습니다(오프라인/미등록).',
+        }));
+      }
+      await fbMessaging.send({
+        token,
+        // data: 앱이 라우팅에 사용(값은 모두 문자열이어야 함).
+        data: {
+          type: 'incoming_call',
+          callId,
+          fromUuid,
+          fromName,
+          room,
+          video: String(video),
+        },
+        // notification: 앱이 백그라운드/종료 상태일 때 시스템 트레이에 표시.
+        notification: {
+          title: fromName || '전화',
+          body: video ? '영상통화 수신' : '음성통화 수신',
+        },
+        android: { priority: 'high' },
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'FCM 전송 실패: ' + String(e) }));
+    }
+  }
+
   if (url.pathname !== '/token') {
     res.writeHead(404);
     return res.end('not found');
@@ -374,5 +456,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  번역 key set = ${GOOGLE_TRANSLATE_API_KEY ? 'yes' : 'NO (/translate 비활성)'}`);
   console.log(`  Azure 번역 = ${AZURE_TRANSLATE_KEY ? `yes (${AZURE_TRANSLATE_REGION})` : 'NO (provider=azure 비활성)'}`);
   console.log(`  기본 엔진   = ${TRANSLATE_PROVIDER}`);
-  console.log(`  엔드포인트  = GET /token?room=<방>&name=<이름>  |  POST /translate {text,target}`);
+  console.log(`  FCM(통화)   = ${fbMessaging ? 'yes' : 'NO (/call 비활성 — FIREBASE_SERVICE_ACCOUNT 필요)'}`);
+  console.log(`  엔드포인트  = GET /token  |  POST /translate  |  POST /call {callId,toUuid,room,video}`);
 });

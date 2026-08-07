@@ -12,6 +12,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "firebase-admin": "^13.0.0",
     "livekit-server-sdk": "^2.9.0"
   }
 }
