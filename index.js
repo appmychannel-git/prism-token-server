@@ -88,6 +88,7 @@ const roomSvc = new RoomServiceClient(HTTP_URL, API_KEY, API_SECRET);
 // 값이 없으면 /call 만 비활성 — 기존 /token, /translate 는 영향 없음.
 let fbMessaging = null;
 let fbFirestore = null;
+let fbAuth = null;
 try {
   const rawSa = process.env.FIREBASE_SERVICE_ACCOUNT || '';
   if (rawSa) {
@@ -95,6 +96,7 @@ try {
     admin.initializeApp({ credential: admin.credential.cert(JSON.parse(rawSa)) });
     fbMessaging = admin.messaging();
     fbFirestore = admin.firestore();
+    fbAuth = admin.auth();
   }
 } catch (e) {
   console.log('firebase-admin init failed:', e && e.message ? e.message : e);
@@ -248,6 +250,40 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Firebase 커스텀 토큰 발급: POST /authtoken body={uuid} → { token }
+  // 앱이 이 토큰으로 signInWithCustomToken → request.auth.uid == uuid (보안 규칙용).
+  if (url.pathname === '/authtoken') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'POST 로 호출하세요.' }));
+    }
+    if (!fbAuth) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'FIREBASE_SERVICE_ACCOUNT 미설정.' }));
+    }
+    let body = {};
+    try {
+      body = JSON.parse((await readBody(req)) || '{}');
+    } catch (_) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '잘못된 요청 본문(JSON) 입니다.' }));
+    }
+    const uuid = (body.uuid || '').toString();
+    // uid 는 1~128자. 우리 uuid(a<ANDROID_ID>_<pkg> 또는 UUIDv4)는 이 범위.
+    if (!uuid || uuid.length > 128) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'uuid 가 올바르지 않습니다.' }));
+    }
+    try {
+      const token = await fbAuth.createCustomToken(uuid);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ token }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '토큰 생성 실패: ' + String(e) }));
+    }
+  }
+
   // 통화 벨: POST /call  body={callId, fromUuid, fromName, toUuid, room, video}
   // 상대(toUuid) 기기 FCM 토큰을 Firestore(devices/{uuid})에서 읽어 수신 푸시를 보낸다.
   if (url.pathname === '/call') {
@@ -279,8 +315,14 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: 'callId, toUuid, room 은 필수입니다.' }));
     }
     try {
-      const snap = await fbFirestore.collection('devices').doc(toUuid).get();
-      const token = snap.exists ? snap.get('fcmToken') : null;
+      // fcmToken 은 클라이언트가 못 읽는 deviceTokens 에서 읽는다(구버전은 devices 폴백).
+      let token = null;
+      const dt = await fbFirestore.collection('deviceTokens').doc(toUuid).get();
+      if (dt.exists) token = dt.get('fcmToken');
+      if (!token) {
+        const snap = await fbFirestore.collection('devices').doc(toUuid).get();
+        token = snap.exists ? snap.get('fcmToken') : null;
+      }
       if (!token) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
