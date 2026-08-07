@@ -287,9 +287,11 @@ const server = http.createServer(async (req, res) => {
           error: '상대 기기를 찾을 수 없습니다(오프라인/미등록).',
         }));
       }
+      // data-only(알림 페이로드 없음) 고우선순위 → 앱의 백그라운드 핸들러가
+      // 항상 실행되어 풀스크린(CATEGORY_CALL) 통화 알림을 직접 띄운다.
+      // (notification 페이로드를 넣으면 시스템 기본 알림과 이중으로 뜨므로 넣지 않는다.)
       await fbMessaging.send({
         token,
-        // data: 앱이 라우팅에 사용(값은 모두 문자열이어야 함).
         data: {
           type: 'incoming_call',
           callId,
@@ -298,16 +300,7 @@ const server = http.createServer(async (req, res) => {
           room,
           video: String(video),
         },
-        // notification: 앱이 백그라운드/종료 상태일 때 시스템이 표시.
-        notification: {
-          title: fromName || '전화',
-          body: video ? '영상통화 수신' : '음성통화 수신',
-        },
-        // 고importance 채널(앱이 미리 생성)로 보내 헤드업+소리로 울리게 한다.
-        android: {
-          priority: 'high',
-          notification: { channelId: 'incoming_calls', sound: 'default' },
-        },
+        android: { priority: 'high' },
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ok: true }));
