@@ -298,12 +298,16 @@ const server = http.createServer(async (req, res) => {
           room,
           video: String(video),
         },
-        // notification: 앱이 백그라운드/종료 상태일 때 시스템 트레이에 표시.
+        // notification: 앱이 백그라운드/종료 상태일 때 시스템이 표시.
         notification: {
           title: fromName || '전화',
           body: video ? '영상통화 수신' : '음성통화 수신',
         },
-        android: { priority: 'high' },
+        // 고importance 채널(앱이 미리 생성)로 보내 헤드업+소리로 울리게 한다.
+        android: {
+          priority: 'high',
+          notification: { channelId: 'incoming_calls', sound: 'default' },
+        },
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ok: true }));
