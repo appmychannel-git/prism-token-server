@@ -284,6 +284,59 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // CCTV 대기모드 원격 켜기: POST /cctv-wake body={code}
+  // cctvCameras/{code}.uuid → deviceTokens/{uuid}.fcmToken → FCM(cctv_wake) 전송.
+  if (url.pathname === '/cctv-wake') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'POST 로 호출하세요.' }));
+    }
+    if (!fbMessaging || !fbFirestore) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'FCM 미설정.' }));
+    }
+    let body = {};
+    try {
+      body = JSON.parse((await readBody(req)) || '{}');
+    } catch (_) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '잘못된 요청 본문(JSON) 입니다.' }));
+    }
+    const code = (body.code || '').toString();
+    if (!code) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'code 는 필수입니다.' }));
+    }
+    try {
+      const cam = await fbFirestore.collection('cctvCameras').doc(code).get();
+      const uuid = cam.exists ? cam.get('uuid') : null;
+      if (!uuid) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          error: '등록된 CCTV 기기를 찾을 수 없습니다.',
+        }));
+      }
+      const dt = await fbFirestore.collection('deviceTokens').doc(uuid).get();
+      const token = dt.exists ? dt.get('fcmToken') : null;
+      if (!token) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          error: 'CCTV 기기가 오프라인입니다(토큰 없음).',
+        }));
+      }
+      await fbMessaging.send({
+        token,
+        data: { type: 'cctv_wake', code },
+        android: { priority: 'high' },
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'CCTV 깨우기 실패: ' + String(e) }));
+    }
+  }
+
   // 통화 벨: POST /call  body={callId, fromUuid, fromName, toUuid, room, video}
   // 상대(toUuid) 기기 FCM 토큰을 Firestore(devices/{uuid})에서 읽어 수신 푸시를 보낸다.
   if (url.pathname === '/call') {
