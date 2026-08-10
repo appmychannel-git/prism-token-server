@@ -371,6 +371,9 @@ const server = http.createServer(async (req, res) => {
   const identity = url.searchParams.get('identity') || name;
   const pin = (url.searchParams.get('pin') || '').trim();
   const isCreate = url.searchParams.get('create') === 'true'; // 방 만들기 여부
+  // dm(1:1 통화)·cctv 방은 여러 당사자가 공유하는 방 → 중복 생성/예약 검사 제외.
+  const isShareRoom = room.startsWith('dm-') || room.startsWith('cctv-');
+  const isCctv = room.startsWith('cctv-');
 
   // ---- 방 존재 확인 + 비공개(입장코드) 검증 ----
   // 코드는 LiveKit 방 메타데이터에 저장(별도 DB 불필요).
@@ -386,7 +389,7 @@ const server = http.createServer(async (req, res) => {
       // (두 번째 생성자가 기존 방에 흡수 입장되지 않고, 다른 이름을 쓰도록 안내)
       // 단, DM 통화방(dm-)은 두 당사자가 공유하는 방이라 중복 거부하지 않고 참여시킨다
       // (발신/수신이 동시에 create 로 들어오는 경쟁 조건 → "이미 사용 중" 오류 방지).
-      if (isCreate && !room.startsWith('dm-')) {
+      if (isCreate && !isShareRoom) {
         res.writeHead(409, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
           error: '이미 사용 중인 방 이름입니다. 다른 이름을 사용하세요.',
@@ -404,9 +407,9 @@ const server = http.createServer(async (req, res) => {
         const now = Math.floor(Date.now() / 1000);
         // 방 종료 후 예약창: RESERVE_SEC 동안은 원래 방장만 같은 이름 재생성 가능.
         // 다른 사람이 그 이름으로 만들려 하면 잠시 막는다.
-        // DM 통화방은 두 당사자 모두 생성할 수 있어야 하므로 예약창 검사 제외.
+        // 공유 방(dm/cctv)은 여러 당사자가 만들 수 있어야 하므로 예약창 검사 제외.
         const rec = recentlyEnded.get(room);
-        if (!room.startsWith('dm-') &&
+        if (!isShareRoom &&
             rec && (now - rec.endedAt) < RESERVE_SEC && rec.host !== identity) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({
@@ -419,7 +422,8 @@ const server = http.createServer(async (req, res) => {
         // TODO(로그인): 로그인·회원 검증 붙으면 여기서 isMember 를 판정한다
         //   (예: 검증된 세션/토큰 확인). 지금은 인증 체계가 없어 전원 게스트 취급.
         const isMember = false;
-        const maxSec = isMember ? ROOM_MAX_SEC_MEMBER : ROOM_MAX_SEC;
+        // CCTV 방은 최대 유지시간 제한 없음(카메라가 앱을 끄면 빈 방이 되어 emptyTimeout으로 종료).
+        const maxSec = isCctv ? 0 : (isMember ? ROOM_MAX_SEC_MEMBER : ROOM_MAX_SEC);
 
         // 만들기: 공개/비공개 모두 즉시 생성. 방장(host)=생성자 identity 저장.
         // createdAt + maxDurationSec: 최대 유지시간 초과 시 sweeper가 자동 종료.
