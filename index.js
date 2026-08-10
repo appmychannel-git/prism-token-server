@@ -384,7 +384,9 @@ const server = http.createServer(async (req, res) => {
     if (existing) {
       // 만들기(create)인데 같은 이름의 방이 이미 있으면 → 이름 중복 거부.
       // (두 번째 생성자가 기존 방에 흡수 입장되지 않고, 다른 이름을 쓰도록 안내)
-      if (isCreate) {
+      // 단, DM 통화방(dm-)은 두 당사자가 공유하는 방이라 중복 거부하지 않고 참여시킨다
+      // (발신/수신이 동시에 create 로 들어오는 경쟁 조건 → "이미 사용 중" 오류 방지).
+      if (isCreate && !room.startsWith('dm-')) {
         res.writeHead(409, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
           error: '이미 사용 중인 방 이름입니다. 다른 이름을 사용하세요.',
@@ -402,8 +404,10 @@ const server = http.createServer(async (req, res) => {
         const now = Math.floor(Date.now() / 1000);
         // 방 종료 후 예약창: RESERVE_SEC 동안은 원래 방장만 같은 이름 재생성 가능.
         // 다른 사람이 그 이름으로 만들려 하면 잠시 막는다.
+        // DM 통화방은 두 당사자 모두 생성할 수 있어야 하므로 예약창 검사 제외.
         const rec = recentlyEnded.get(room);
-        if (rec && (now - rec.endedAt) < RESERVE_SEC && rec.host !== identity) {
+        if (!room.startsWith('dm-') &&
+            rec && (now - rec.endedAt) < RESERVE_SEC && rec.host !== identity) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({
             error: '최근까지 사용된 방 이름입니다. 잠시 후 다시 시도하세요.',
