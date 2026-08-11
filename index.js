@@ -73,6 +73,17 @@ function readBody(req) {
 // 종료 후 RESERVE_SEC 동안 원래 방장(host identity)만 같은 이름 재생성 가능.
 // (메모리 보관 → 서버 재시작 시 초기화됨. 짧은 창이라 영향 미미.)
 const recentlyEnded = new Map();
+
+// 비밀번호(pin) 무차별 대입 방지: 방+IP 기준으로 실패 누적 시 일시 잠금.
+const PIN_MAX_FAILS = Number(process.env.PIN_MAX_FAILS || 5);
+const PIN_LOCK_SEC = Number(process.env.PIN_LOCK_SEC || 300); // 5분
+const pinAttempts = new Map(); // `${room}|${ip}` -> { fails, lockUntil(초) }
+function clientIp(req) {
+  const xff = (req.headers['x-forwarded-for'] || '').toString();
+  return xff.split(',')[0].trim() ||
+    (req.socket && req.socket.remoteAddress) || '';
+}
+
 function markEnded(room, host) {
   if (room) {
     recentlyEnded.set(room, { host: host || '', endedAt: Math.floor(Date.now() / 1000) });
@@ -422,7 +433,9 @@ const server = http.createServer(async (req, res) => {
   // identity(고정 식별값)와 name(표시 이름)을 분리.
   // 같은 identity로 재접속하면 서버가 이전 세션을 즉시 교체 → 유령 참가자 방지.
   const identity = url.searchParams.get('identity') || name;
-  const pin = (url.searchParams.get('pin') || '').trim();
+  // 비밀번호는 헤더로 받는다(URL 쿼리 로그 노출 방지). 구버전 앱 호환용 쿼리 폴백.
+  const pin = (req.headers['x-room-pin'] ||
+    url.searchParams.get('pin') || '').toString().trim();
   const isCreate = url.searchParams.get('create') === 'true'; // 방 만들기 여부
   // dm(1:1 통화)·cctv 방은 여러 당사자가 공유하는 방 → 중복 생성/예약 검사 제외.
   const isShareRoom = room.startsWith('dm-') || room.startsWith('cctv-');
@@ -450,10 +463,29 @@ const server = http.createServer(async (req, res) => {
       }
       let meta = {};
       try { meta = JSON.parse(existing.metadata || '{}'); } catch (_) {}
-      if (meta.private && (!pin || pin !== meta.pin)) {
-        res.writeHead(403, { 'Content-Type': 'application/json' });
-        return res.end(
-          JSON.stringify({ error: '입장 코드가 올바르지 않습니다.' }));
+      if (meta.private) {
+        const now = Math.floor(Date.now() / 1000);
+        const akey = `${room}|${clientIp(req)}`;
+        const rec = pinAttempts.get(akey) || { fails: 0, lockUntil: 0 };
+        // 잠금 중이면 거부.
+        if (rec.lockUntil > now) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({
+            error: '비밀번호 시도가 많습니다. 잠시 후 다시 시도하세요.',
+          }));
+        }
+        if (!pin || pin !== meta.pin) {
+          rec.fails += 1;
+          if (rec.fails >= PIN_MAX_FAILS) {
+            rec.lockUntil = now + PIN_LOCK_SEC;
+            rec.fails = 0;
+          }
+          pinAttempts.set(akey, rec);
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          return res.end(
+            JSON.stringify({ error: '입장 코드가 올바르지 않습니다.' }));
+        }
+        pinAttempts.delete(akey); // 성공 시 실패 카운트 리셋
       }
     } else {
       if (isCreate) {
@@ -543,6 +575,14 @@ setInterval(async () => {
     // 만료된 예약 정리
     for (const [nm, rec] of recentlyEnded) {
       if (now - rec.endedAt >= RESERVE_SEC) recentlyEnded.delete(nm);
+    }
+    // 만료된 비밀번호 시도 기록 정리
+    for (const [k, rec] of pinAttempts) {
+      if ((rec.lockUntil || 0) < now && (rec.fails || 0) === 0) {
+        pinAttempts.delete(k);
+      } else if ((rec.lockUntil || 0) !== 0 && rec.lockUntil < now) {
+        pinAttempts.delete(k);
+      }
     }
   } catch (e) {
     console.log('sweep error:', e && e.message ? e.message : e);
