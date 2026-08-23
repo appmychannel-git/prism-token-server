@@ -115,20 +115,34 @@ try {
 
 // ---- APNs VoIP (iOS 통화 수신용 PushKit/CallKit) ----
 // iOS 는 데이터 전용 FCM 으로 꺼진 앱을 못 깨우므로, VoIP 푸시로 앱을 깨워 CallKit 을 띄운다.
-// Render 환경변수: APNS_KEY_P8(.p8 파일 내용), APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID.
-//   - 개발서명(flutter run) 빌드는 sandbox APNs, TestFlight/AppStore 는 production.
-//     어느 환경인지 앱이 알기 어려워 production 먼저 보내고 BadDeviceToken 이면 sandbox 로 재시도한다.
+//
+// ⚠️ APNs 인증 키(.p8)는 "환경 전용"일 수 있다(Apple 이 개발/프로덕션 키를 따로 발급).
+//   - 프로덕션 키 → production 엔드포인트(TestFlight/AppStore 빌드)
+//   - 개발 키     → sandbox 엔드포인트(flutter run 개발서명 빌드)
+//   프로덕션 키를 sandbox 로 쓰면 BadEnvironmentKeyInToken, 반대는 BadDeviceToken 이 난다.
+//   그래서 두 키를 모두 받아 각 엔드포인트에 맞는 키로 보낸다.
+//
+// Render 환경변수:
+//   APNS_TEAM_ID, APNS_BUNDLE_ID
+//   APNS_KEY_P8      / APNS_KEY_ID      → 프로덕션 키(production 엔드포인트)
+//   APNS_KEY_P8_DEV  / APNS_KEY_ID_DEV  → 개발 키(sandbox 엔드포인트)
+//   (개발 키가 없으면 프로덕션 키로 sandbox 도 시도 — 환경전용 키면 실패할 수 있음)
 const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'kr.co.mychannel.meeting.prism';
-let apnProviders = null; // { prod, sandbox }
+let apnProviders = null; // { prod, sandbox } (각각 null 가능)
 try {
-  const p8 = (process.env.APNS_KEY_P8 || '').replace(/\\n/g, '\n');
-  const keyId = process.env.APNS_KEY_ID || '';
   const teamId = process.env.APNS_TEAM_ID || '';
-  if (p8 && keyId && teamId) {
+  const prodP8 = (process.env.APNS_KEY_P8 || '').replace(/\\n/g, '\n');
+  const prodKeyId = process.env.APNS_KEY_ID || '';
+  // 개발 키 미지정 시 프로덕션 키로 폴백(환경전용 키면 sandbox 에서 실패할 수 있음).
+  const devP8 = (process.env.APNS_KEY_P8_DEV || '').replace(/\\n/g, '\n') || prodP8;
+  const devKeyId = process.env.APNS_KEY_ID_DEV || prodKeyId;
+  if (teamId) {
     const apn = require('@parse/node-apn');
-    const mk = (production) =>
-      new apn.Provider({ token: { key: p8, keyId, teamId }, production });
-    apnProviders = { prod: mk(true), sandbox: mk(false) };
+    const mk = (key, keyId, production) =>
+      key && keyId ? new apn.Provider({ token: { key, keyId, teamId }, production }) : null;
+    const prod = mk(prodP8, prodKeyId, true);
+    const sandbox = mk(devP8, devKeyId, false);
+    if (prod || sandbox) apnProviders = { prod, sandbox };
   }
 } catch (e) {
   console.log('APNs(VoIP) init failed:', e && e.message ? e.message : e);
@@ -144,28 +158,29 @@ async function sendVoipPush(voipToken, data) {
   note.priority = 10;
   note.expiry = Math.floor(Date.now() / 1000) + 30; // 30초 내 미수신 시 폐기
   note.payload = data;
-  // 개발서명(flutter run) 빌드는 sandbox 토큰, TestFlight/AppStore 는 production 토큰.
-  // 앱이 어느 환경인지 알기 어려우므로 production 먼저 시도하고, 실패하면(어떤 사유든:
-  // BadDeviceToken / BadEnvironmentKeyInToken 등) sandbox 로 재시도한다. 둘 중 하나만
-  // 성공하면 OK.
-  let r = await apnProviders.prod.send(note, voipToken);
-  let via = 'prod';
-  if (r.failed && r.failed.length) {
-    const prodReason = r.failed[0].response
-      ? JSON.stringify(r.failed[0].response)
-      : String(r.failed[0].error);
-    const rs = await apnProviders.sandbox.send(note, voipToken);
-    if (!(rs.failed && rs.failed.length)) {
-      via = 'sandbox';
-      r = rs;
-    } else {
-      const sbReason = rs.failed[0].response
-        ? JSON.stringify(rs.failed[0].response)
-        : String(rs.failed[0].error);
-      throw new Error(`VoIP 전송 실패 (prod=${prodReason}, sandbox=${sbReason})`);
-    }
+  // production(프로덕션 키) 먼저 시도, 실패하면 sandbox(개발 키)로 재시도. 둘 중 하나만
+  // 성공하면 OK. 각 엔드포인트는 그 환경의 키로 보내야 한다(환경전용 키 대응).
+  const reason = (res) =>
+    res.failed && res.failed.length
+      ? (res.failed[0].response ? JSON.stringify(res.failed[0].response) : String(res.failed[0].error))
+      : null;
+  const attempts = [];
+  let prodReason = 'skip(no prod key)';
+  let sbReason = 'skip(no dev key)';
+
+  if (apnProviders.prod) {
+    const rp = await apnProviders.prod.send(note, voipToken);
+    prodReason = reason(rp);
+    if (!prodReason) { console.log('[voip] sent via prod'); return; }
+    attempts.push(`prod=${prodReason}`);
   }
-  console.log(`[voip] sent via ${via}`);
+  if (apnProviders.sandbox) {
+    const rs = await apnProviders.sandbox.send(note, voipToken);
+    sbReason = reason(rs);
+    if (!sbReason) { console.log('[voip] sent via sandbox'); return; }
+    attempts.push(`sandbox=${sbReason}`);
+  }
+  throw new Error('VoIP 전송 실패 (' + (attempts.join(', ') || 'no provider') + ')');
 }
 
 const server = http.createServer(async (req, res) => {
@@ -685,6 +700,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  Azure 번역 = ${AZURE_TRANSLATE_KEY ? `yes (${AZURE_TRANSLATE_REGION})` : 'NO (provider=azure 비활성)'}`);
   console.log(`  기본 엔진   = ${TRANSLATE_PROVIDER}`);
   console.log(`  FCM(통화)   = ${fbMessaging ? 'yes' : 'NO (/call 비활성 — FIREBASE_SERVICE_ACCOUNT 필요)'}`);
-  console.log(`  VoIP(iOS)   = ${apnProviders ? `yes (topic ${APNS_BUNDLE_ID}.voip)` : 'NO (APNS_KEY_P8/KEY_ID/TEAM_ID 필요 — iOS 꺼진앱 수신 불가)'}`);
+  console.log(`  VoIP(iOS)   = ${apnProviders ? `yes (topic ${APNS_BUNDLE_ID}.voip; prod키=${apnProviders.prod ? 'Y' : 'N'} dev키=${apnProviders.sandbox ? 'Y' : 'N'})` : 'NO (APNS_KEY_P8/KEY_ID/TEAM_ID 필요 — iOS 꺼진앱 수신 불가)'}`);
   console.log(`  엔드포인트  = GET /token  |  POST /translate  |  POST /call {callId,toUuid,room,video}`);
 });

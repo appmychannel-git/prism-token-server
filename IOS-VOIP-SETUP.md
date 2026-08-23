@@ -3,14 +3,25 @@
 iOS는 데이터 전용 FCM으로 **꺼진 앱을 못 깨운다.** 그래서 `/call`은 상대가 iOS(voipToken 보유)면
 **APNs VoIP 푸시**를 직접 보내 PushKit이 앱을 깨우고 CallKit(네이티브 전화 UI)을 띄운다.
 
-이걸 켜려면 Render 대시보드 → `prism-token-server` → **Environment** 에 아래 4개를 추가한다.
+⚠️ **APNs 인증 키(.p8)는 환경 전용일 수 있다** (Apple 이 개발/프로덕션 키를 따로 발급).
+- 프로덕션 키 → production 엔드포인트 (TestFlight/AppStore 빌드)
+- 개발 키 → sandbox 엔드포인트 (flutter run 개발서명 빌드)
+- 프로덕션 키를 sandbox 에 쓰면 `BadEnvironmentKeyInToken`, 개발 토큰을 production 에 쓰면 `BadDeviceToken` 이 난다.
+
+그래서 **두 키를 모두** Render 에 넣어야 개발빌드·배포빌드 양쪽에서 통화 수신이 된다.
+Render 대시보드 → `prism-token-server` → **Environment**:
 
 | Key | 값 | 비고 |
 |-----|-----|------|
-| `APNS_KEY_P8` | `.p8` 파일 **내용 전체** (BEGIN/END 포함) | **Firebase에 올린 그 APNs 키와 동일 파일** 재사용 |
-| `APNS_KEY_ID` | 그 키의 Key ID (10자) | Apple Developer → Keys 에서 확인 |
+| `APNS_KEY_P8` | **프로덕션 키**(.p8) 파일 내용 전체 | 예: TN7N38SZFY |
+| `APNS_KEY_ID` | 프로덕션 키의 Key ID | 예: `TN7N38SZFY` |
+| `APNS_KEY_P8_DEV` | **개발 키**(.p8) 파일 내용 전체 | 예: 7W6TH8P4UD |
+| `APNS_KEY_ID_DEV` | 개발 키의 Key ID | 예: `7W6TH8P4UD` |
 | `APNS_TEAM_ID` | `N7653V74T8` | Apple 팀 ID |
-| `APNS_BUNDLE_ID` | `kr.co.mychannel.meeting.prism` | prism 번들 ID(기본값이라 생략 가능) |
+| `APNS_BUNDLE_ID` | `kr.co.mychannel.meeting.prism` | prism 번들 ID(생략 가능) |
+
+> 키가 범용(환경 무관)이면 `APNS_KEY_P8` 하나만 넣어도 양쪽 동작한다. 환경 전용 키(위 케이스)면 **둘 다 필수**.
+> 시작 로그에 `prod키=Y dev키=Y` 로 나오면 둘 다 인식된 것.
 
 ## `.p8` 내용 넣는 법
 `.p8` 파일을 텍스트 에디터로 열어 전체를 복사해 `APNS_KEY_P8` 값에 붙여넣는다. 형태:
