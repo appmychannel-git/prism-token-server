@@ -113,6 +113,48 @@ try {
   console.log('firebase-admin init failed:', e && e.message ? e.message : e);
 }
 
+// ---- APNs VoIP (iOS 통화 수신용 PushKit/CallKit) ----
+// iOS 는 데이터 전용 FCM 으로 꺼진 앱을 못 깨우므로, VoIP 푸시로 앱을 깨워 CallKit 을 띄운다.
+// Render 환경변수: APNS_KEY_P8(.p8 파일 내용), APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID.
+//   - 개발서명(flutter run) 빌드는 sandbox APNs, TestFlight/AppStore 는 production.
+//     어느 환경인지 앱이 알기 어려워 production 먼저 보내고 BadDeviceToken 이면 sandbox 로 재시도한다.
+const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'kr.co.mychannel.meeting.prism';
+let apnProviders = null; // { prod, sandbox }
+try {
+  const p8 = (process.env.APNS_KEY_P8 || '').replace(/\\n/g, '\n');
+  const keyId = process.env.APNS_KEY_ID || '';
+  const teamId = process.env.APNS_TEAM_ID || '';
+  if (p8 && keyId && teamId) {
+    const apn = require('@parse/node-apn');
+    const mk = (production) =>
+      new apn.Provider({ token: { key: p8, keyId, teamId }, production });
+    apnProviders = { prod: mk(true), sandbox: mk(false) };
+  }
+} catch (e) {
+  console.log('APNs(VoIP) init failed:', e && e.message ? e.message : e);
+}
+
+// iOS VoIP 푸시 전송. data = {id, nameCaller, handle, isVideo, room, fromUuid, callId}
+async function sendVoipPush(voipToken, data) {
+  if (!apnProviders) throw new Error('APNs 미설정(APNS_KEY_P8/APNS_KEY_ID/APNS_TEAM_ID).');
+  const apn = require('@parse/node-apn');
+  const note = new apn.Notification();
+  note.topic = APNS_BUNDLE_ID + '.voip'; // VoIP 는 반드시 <bundleId>.voip 토픽
+  note.pushType = 'voip';
+  note.priority = 10;
+  note.expiry = Math.floor(Date.now() / 1000) + 30; // 30초 내 미수신 시 폐기
+  note.payload = data;
+  let r = await apnProviders.prod.send(note, voipToken);
+  const f0 = r.failed && r.failed[0];
+  if (f0 && f0.response && f0.response.reason === 'BadDeviceToken') {
+    r = await apnProviders.sandbox.send(note, voipToken); // dev 빌드(sandbox) 재시도
+  }
+  if (r.failed && r.failed.length) {
+    const f = r.failed[0];
+    throw new Error('VoIP 전송 실패: ' + (f.response ? JSON.stringify(f.response) : String(f.error)));
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   // 웹(Flutter web)에서 fetch 가능하도록 CORS 허용
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -379,25 +421,47 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: 'callId, toUuid, room 은 필수입니다.' }));
     }
     try {
-      // fcmToken 은 클라이언트가 못 읽는 deviceTokens 에서 읽는다(구버전은 devices 폴백).
-      let token = null;
+      // 토큰은 클라이언트가 못 읽는 deviceTokens 에서 읽는다(구버전은 devices 폴백).
+      let fcmToken = null;
+      let voipToken = null;
       const dt = await fbFirestore.collection('deviceTokens').doc(toUuid).get();
-      if (dt.exists) token = dt.get('fcmToken');
-      if (!token) {
-        const snap = await fbFirestore.collection('devices').doc(toUuid).get();
-        token = snap.exists ? snap.get('fcmToken') : null;
+      if (dt.exists) {
+        fcmToken = dt.get('fcmToken');
+        voipToken = dt.get('voipToken'); // iOS 만 존재
       }
-      if (!token) {
+      if (!fcmToken) {
+        const snap = await fbFirestore.collection('devices').doc(toUuid).get();
+        fcmToken = snap.exists ? snap.get('fcmToken') : null;
+      }
+
+      // iOS(voipToken 있음) → VoIP 푸시로 CallKit 표시(꺼진 앱/잠금/절전에서도 수신).
+      if (voipToken && apnProviders) {
+        await sendVoipPush(voipToken, {
+          id: callId,
+          nameCaller: fromName || '전화',
+          handle: fromName || '',
+          isVideo: video,
+          room,
+          fromUuid,
+          callId,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: true, via: 'voip' }));
+      }
+      if (voipToken && !apnProviders) {
+        console.log('[/call] voipToken 있으나 APNs 미설정 → FCM 폴백(iOS 꺼진앱 수신 불가)');
+      }
+
+      if (!fcmToken) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
           error: '상대 기기를 찾을 수 없습니다(오프라인/미등록).',
         }));
       }
-      // data-only(알림 페이로드 없음) 고우선순위 → 앱의 백그라운드 핸들러가
+      // Android: data-only(알림 페이로드 없음) 고우선순위 → 앱의 백그라운드 핸들러가
       // 항상 실행되어 풀스크린(CATEGORY_CALL) 통화 알림을 직접 띄운다.
-      // (notification 페이로드를 넣으면 시스템 기본 알림과 이중으로 뜨므로 넣지 않는다.)
       await fbMessaging.send({
-        token,
+        token: fcmToken,
         data: {
           type: 'incoming_call',
           callId,
@@ -409,7 +473,7 @@ const server = http.createServer(async (req, res) => {
         android: { priority: 'high' },
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true }));
+      return res.end(JSON.stringify({ ok: true, via: 'fcm' }));
     } catch (e) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: 'FCM 전송 실패: ' + String(e) }));
@@ -597,5 +661,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  Azure 번역 = ${AZURE_TRANSLATE_KEY ? `yes (${AZURE_TRANSLATE_REGION})` : 'NO (provider=azure 비활성)'}`);
   console.log(`  기본 엔진   = ${TRANSLATE_PROVIDER}`);
   console.log(`  FCM(통화)   = ${fbMessaging ? 'yes' : 'NO (/call 비활성 — FIREBASE_SERVICE_ACCOUNT 필요)'}`);
+  console.log(`  VoIP(iOS)   = ${apnProviders ? `yes (topic ${APNS_BUNDLE_ID}.voip)` : 'NO (APNS_KEY_P8/KEY_ID/TEAM_ID 필요 — iOS 꺼진앱 수신 불가)'}`);
   console.log(`  엔드포인트  = GET /token  |  POST /translate  |  POST /call {callId,toUuid,room,video}`);
 });
