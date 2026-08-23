@@ -434,19 +434,28 @@ const server = http.createServer(async (req, res) => {
         fcmToken = snap.exists ? snap.get('fcmToken') : null;
       }
 
+      console.log(`[/call] callId=${callId} toUuid=${toUuid} voipToken=${voipToken ? 'Y' : 'N'} fcmToken=${fcmToken ? 'Y' : 'N'} apns=${apnProviders ? 'Y' : 'N'}`);
+
       // iOS(voipToken 있음) → VoIP 푸시로 CallKit 표시(꺼진 앱/잠금/절전에서도 수신).
       if (voipToken && apnProviders) {
-        await sendVoipPush(voipToken, {
-          id: callId,
-          nameCaller: fromName || '전화',
-          handle: fromName || '',
-          isVideo: video,
-          room,
-          fromUuid,
-          callId,
-        });
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ ok: true, via: 'voip' }));
+        try {
+          await sendVoipPush(voipToken, {
+            id: callId,
+            nameCaller: fromName || '전화',
+            handle: fromName || '',
+            isVideo: video,
+            room,
+            fromUuid,
+            callId,
+          });
+          console.log(`[/call] → VoIP 전송 완료 callId=${callId}`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: true, via: 'voip' }));
+        } catch (ve) {
+          console.log(`[/call] !! VoIP 전송 실패 callId=${callId}: ${String(ve)}`);
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'VoIP 전송 실패: ' + String(ve) }));
+        }
       }
       if (voipToken && !apnProviders) {
         console.log('[/call] voipToken 있으나 APNs 미설정 → FCM 폴백(iOS 꺼진앱 수신 불가)');
@@ -472,11 +481,13 @@ const server = http.createServer(async (req, res) => {
         },
         android: { priority: 'high' },
       });
+      console.log(`[/call] → FCM 전송 완료 callId=${callId}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ok: true, via: 'fcm' }));
     } catch (e) {
+      console.log(`[/call] !! 에러 callId=${callId}: ${String(e)}`);
       res.writeHead(502, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'FCM 전송 실패: ' + String(e) }));
+      return res.end(JSON.stringify({ error: '전송 실패: ' + String(e) }));
     }
   }
 
