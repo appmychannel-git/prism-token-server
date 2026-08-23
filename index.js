@@ -149,11 +149,12 @@ try {
 }
 
 // iOS VoIP 푸시 전송. data = {id, nameCaller, handle, isVideo, room, fromUuid, callId}
-async function sendVoipPush(voipToken, data) {
+// bundleId: 받는 기기의 번들 ID(브랜드별로 다름). VoIP 토픽은 <그 기기 bundleId>.voip 여야 함.
+async function sendVoipPush(voipToken, data, bundleId) {
   if (!apnProviders) throw new Error('APNs 미설정(APNS_KEY_P8/APNS_KEY_ID/APNS_TEAM_ID).');
   const apn = require('@parse/node-apn');
   const note = new apn.Notification();
-  note.topic = APNS_BUNDLE_ID + '.voip'; // VoIP 는 반드시 <bundleId>.voip 토픽
+  note.topic = (bundleId || APNS_BUNDLE_ID) + '.voip'; // VoIP 는 반드시 <bundleId>.voip 토픽
   note.pushType = 'voip';
   note.priority = 10;
   note.expiry = Math.floor(Date.now() / 1000) + 30; // 30초 내 미수신 시 폐기
@@ -452,17 +453,19 @@ const server = http.createServer(async (req, res) => {
       // 토큰은 클라이언트가 못 읽는 deviceTokens 에서 읽는다(구버전은 devices 폴백).
       let fcmToken = null;
       let voipToken = null;
+      let bundleId = null;
       const dt = await fbFirestore.collection('deviceTokens').doc(toUuid).get();
       if (dt.exists) {
         fcmToken = dt.get('fcmToken');
         voipToken = dt.get('voipToken'); // iOS 만 존재
+        bundleId = dt.get('bundleId'); // 브랜드별 번들 ID(iOS VoIP 토픽용)
       }
       if (!fcmToken) {
         const snap = await fbFirestore.collection('devices').doc(toUuid).get();
         fcmToken = snap.exists ? snap.get('fcmToken') : null;
       }
 
-      console.log(`[/call] callId=${callId} toUuid=${toUuid} voipToken=${voipToken ? 'Y' : 'N'} fcmToken=${fcmToken ? 'Y' : 'N'} apns=${apnProviders ? 'Y' : 'N'}`);
+      console.log(`[/call] callId=${callId} toUuid=${toUuid} voipToken=${voipToken ? 'Y' : 'N'} fcmToken=${fcmToken ? 'Y' : 'N'} apns=${apnProviders ? 'Y' : 'N'} bundleId=${bundleId || '(default)'}`);
 
       // iOS(voipToken 있음) → VoIP 푸시로 CallKit 표시(꺼진 앱/잠금/절전에서도 수신).
       if (voipToken && apnProviders) {
@@ -475,7 +478,7 @@ const server = http.createServer(async (req, res) => {
             room,
             fromUuid,
             callId,
-          });
+          }, bundleId);
           console.log(`[/call] → VoIP 전송 완료 callId=${callId}`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ ok: true, via: 'voip' }));
