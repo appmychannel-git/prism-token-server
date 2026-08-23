@@ -144,15 +144,28 @@ async function sendVoipPush(voipToken, data) {
   note.priority = 10;
   note.expiry = Math.floor(Date.now() / 1000) + 30; // 30초 내 미수신 시 폐기
   note.payload = data;
+  // 개발서명(flutter run) 빌드는 sandbox 토큰, TestFlight/AppStore 는 production 토큰.
+  // 앱이 어느 환경인지 알기 어려우므로 production 먼저 시도하고, 실패하면(어떤 사유든:
+  // BadDeviceToken / BadEnvironmentKeyInToken 등) sandbox 로 재시도한다. 둘 중 하나만
+  // 성공하면 OK.
   let r = await apnProviders.prod.send(note, voipToken);
-  const f0 = r.failed && r.failed[0];
-  if (f0 && f0.response && f0.response.reason === 'BadDeviceToken') {
-    r = await apnProviders.sandbox.send(note, voipToken); // dev 빌드(sandbox) 재시도
-  }
+  let via = 'prod';
   if (r.failed && r.failed.length) {
-    const f = r.failed[0];
-    throw new Error('VoIP 전송 실패: ' + (f.response ? JSON.stringify(f.response) : String(f.error)));
+    const prodReason = r.failed[0].response
+      ? JSON.stringify(r.failed[0].response)
+      : String(r.failed[0].error);
+    const rs = await apnProviders.sandbox.send(note, voipToken);
+    if (!(rs.failed && rs.failed.length)) {
+      via = 'sandbox';
+      r = rs;
+    } else {
+      const sbReason = rs.failed[0].response
+        ? JSON.stringify(rs.failed[0].response)
+        : String(rs.failed[0].error);
+      throw new Error(`VoIP 전송 실패 (prod=${prodReason}, sandbox=${sbReason})`);
+    }
   }
+  console.log(`[voip] sent via ${via}`);
 }
 
 const server = http.createServer(async (req, res) => {
