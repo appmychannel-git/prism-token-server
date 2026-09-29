@@ -818,6 +818,8 @@ const server = http.createServer(async (req, res) => {
       room: room,
       canPublish: true,
       canSubscribe: true,
+      // 앱이 회의 중 "말하는 언어"를 참가자 속성(setAttributes)으로 갱신할 수 있게 허용.
+      canUpdateOwnMetadata: true,
     });
     const token = await at.toJwt();
 
