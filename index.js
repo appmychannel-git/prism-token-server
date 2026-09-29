@@ -12,7 +12,7 @@
 // 서버는 { serverUrl, participantToken } 을 반환합니다.
 
 const http = require('http');
-const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
+const { AccessToken, RoomServiceClient, WebhookReceiver } = require('livekit-server-sdk');
 
 const LIVEKIT_URL = process.env.LIVEKIT_URL || 'wss://YOUR-PROJECT.livekit.cloud';
 const API_KEY = process.env.LIVEKIT_API_KEY || '';
@@ -40,6 +40,21 @@ const AZURE_TRANSLATE_KEY = process.env.AZURE_TRANSLATE_KEY || '';
 const AZURE_TRANSLATE_REGION = process.env.AZURE_TRANSLATE_REGION || '';
 const AZURE_TRANSLATE_ENDPOINT = (process.env.AZURE_TRANSLATE_ENDPOINT ||
   'https://api.cognitive.microsofttranslator.com').replace(/\/+$/, '');
+// DeepL(품질 비교용). provider=deepl 로 호출 시 사용.
+// 무료 키(끝이 ':fx')는 api-free, 유료 키는 api.deepl.com 을 자동 선택.
+const DEEPL_API_KEY = process.env.DEEPL_API_KEY || '';
+const DEEPL_ENDPOINT = (process.env.DEEPL_ENDPOINT ||
+  (DEEPL_API_KEY.endsWith(':fx') ? 'https://api-free.deepl.com' : 'https://api.deepl.com')
+  ).replace(/\/+$/, '');
+// 앱의 2글자 코드 → DeepL 언어코드(대문자, 일부 특수).
+function _deeplLang(code, isTarget) {
+  const c = (code || '').toUpperCase();
+  if (!c) return '';
+  if (c === 'EN') return isTarget ? 'EN-US' : 'EN';
+  if (c === 'PT') return isTarget ? 'PT-BR' : 'PT';
+  if (c === 'ZH') return 'ZH';
+  return c; // KO, RU, KK, JA, FR, ES, DE, AR ... 는 그대로 대문자
+}
 // 이 배포의 기본 번역 엔진: 'google'(기본) | 'azure'.
 // 거래처별 토큰서버를 따로 띄울 때 이 값만 바꾸면 앱 수정 없이 엔진이 갈린다.
 // (예: 카자흐스탄 서버 TRANSLATE_PROVIDER=azure, 르완다 서버=google)
@@ -184,6 +199,86 @@ async function sendVoipPush(voipToken, data, bundleId) {
   throw new Error('VoIP 전송 실패 (' + (attempts.join(', ') || 'no provider') + ')');
 }
 
+// ---- LiveKit 사용량 집계(브랜드별 참가자-분) + 임계치 알림 ----
+// LiveKit Cloud 프로젝트 설정 → Webhooks 에 이 서버의 /livekit-webhook 를 등록해야
+// participant_left 이벤트가 들어온다. 참가자 접속 시간을 appId(브랜드)별로 Firestore 에 누적.
+//   - 저장 위치: 컬렉션 lkUsage / 문서 YYYY-MM(UTC) / { total, brands:{...}, alerted80/100 }
+//   - 조회: GET /usage[?month=YYYY-MM]   (ADMIN_KEY 설정 시 key 필요)
+const lkWebhook = (API_KEY && API_SECRET) ? new WebhookReceiver(API_KEY, API_SECRET) : null;
+// 이번 달 총 참가자-분이 이 값의 80%/100% 도달 시 1회씩 알림(0이면 알림 끔). 예: Ship=150000.
+const USAGE_ALERT_MINUTES = Number(process.env.USAGE_ALERT_MINUTES || 0);
+// 알림 전송 대상(POST JSON {text}). Slack Incoming Webhook 또는 Zapier/Make(→메일) 훅 URL.
+const ALERT_WEBHOOK_URL = process.env.ALERT_WEBHOOK_URL || '';
+// /usage 조회 보호(설정 시 x-admin-key 헤더 또는 ?key= 가 일치해야 조회 가능).
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
+function usageMonthKey(d) {
+  d = d || new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+// Firestore 필드명엔 '.' 등을 못 쓰므로 브랜드(패키지명)의 특수문자를 '_'로.
+function fsKey(s) { return (s || 'unknown').replace(/[.#$/[\]]/g, '_'); }
+
+async function sendUsageAlert(subject, text) {
+  console.log('[USAGE ALERT]', subject, '-', text);
+  if (!ALERT_WEBHOOK_URL) return;
+  try {
+    await fetch(ALERT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: `⚠️ ${subject}\n${text}` }),
+    });
+  } catch (e) { console.log('alert send failed:', e && e.message ? e.message : e); }
+}
+
+async function addUsage(brand, minutes) {
+  if (!fbFirestore || !(minutes > 0)) return;
+  const admin = require('firebase-admin');
+  const mk = usageMonthKey();
+  const ref = fbFirestore.collection('lkUsage').doc(mk);
+  const inc = admin.firestore.FieldValue.increment(minutes);
+  await ref.set({
+    month: mk,
+    total: inc,
+    brands: { [fsKey(brand)]: inc },
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  if (USAGE_ALERT_MINUTES > 0) {
+    try {
+      const d = (await ref.get()).data() || {};
+      const total = Number(d.total || 0);
+      const pct = total / USAGE_ALERT_MINUTES;
+      if (pct >= 1 && !d.alerted100) {
+        await ref.set({ alerted100: true }, { merge: true });
+        await sendUsageAlert('LiveKit 사용량 100% 초과',
+          `${mk} 누적 ${Math.round(total)}분 / 한도 ${USAGE_ALERT_MINUTES}분`);
+      } else if (pct >= 0.8 && !d.alerted80) {
+        await ref.set({ alerted80: true }, { merge: true });
+        await sendUsageAlert('LiveKit 사용량 80% 도달',
+          `${mk} 누적 ${Math.round(total)}분 / 한도 ${USAGE_ALERT_MINUTES}분 (${Math.round(pct * 100)}%)`);
+      }
+    } catch (e) { console.log('usage alert check failed:', e && e.message ? e.message : e); }
+  }
+}
+
+async function handleLkWebhookEvent(event) {
+  if (!event || event.event !== 'participant_left') return;
+  const p = event.participant;
+  if (!p || !p.identity) return;
+  // 자막봇/녹화(egress)는 사용자 사용량이 아니므로 제외.
+  if (p.identity === 'captions-bot' || p.identity.startsWith('EG_')) return;
+  const joinedAt = Number(p.joinedAt || 0);                       // unix 초
+  const leftAt = Number(event.createdAt || Math.floor(Date.now() / 1000));
+  if (!(joinedAt > 0) || !(leftAt > joinedAt)) return;
+  let minutes = (leftAt - joinedAt) / 60;
+  if (minutes > 24 * 60) minutes = 24 * 60;                       // 이상치 상한
+  minutes = Math.round(minutes * 100) / 100;
+  let brand = '';
+  try { brand = JSON.parse(p.metadata || '{}').appId || ''; } catch (_) {}
+  await addUsage(brand, minutes);
+}
+
 const server = http.createServer(async (req, res) => {
   // 웹(Flutter web)에서 fetch 가능하도록 CORS 허용
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -199,6 +294,48 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, serverUrl: LIVEKIT_URL }));
+  }
+
+  // LiveKit 웹훅 수신: participant_left 시 브랜드별 사용량(참가자-분) 누적.
+  // LiveKit Cloud 프로젝트 설정에 이 URL 을 등록해야 이벤트가 들어온다.
+  if (url.pathname === '/livekit-webhook' && req.method === 'POST') {
+    if (lkWebhook) {
+      try {
+        const raw = await readBody(req);
+        const event = await lkWebhook.receive(raw, req.headers['authorization']);
+        await handleLkWebhookEvent(event);
+      } catch (e) {
+        console.log('livekit-webhook error:', e && e.message ? e.message : e);
+      }
+    }
+    res.writeHead(200); // 항상 200 — 실패해도 LiveKit 재전송 폭주 방지
+    return res.end('ok');
+  }
+
+  // 사용량 조회: GET /usage[?month=YYYY-MM] → { month, total, brands:{패키지명:분} }
+  if (url.pathname === '/usage') {
+    if (ADMIN_KEY) {
+      const k = (req.headers['x-admin-key'] ||
+        url.searchParams.get('key') || '').toString();
+      if (k !== ADMIN_KEY) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'forbidden' }));
+      }
+    }
+    const mk = (url.searchParams.get('month') || usageMonthKey()).toString();
+    let data = {};
+    try {
+      if (fbFirestore) {
+        const snap = await fbFirestore.collection('lkUsage').doc(mk).get();
+        data = snap.exists ? snap.data() : {};
+      }
+    } catch (e) { console.log('usage read error:', e && e.message ? e.message : e); }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      month: mk,
+      alertLimitMinutes: USAGE_ALERT_MINUTES || null,
+      ...data,
+    }));
   }
 
   // 채팅 번역: POST /translate  body={text, target, source?} → {translatedText, detectedSourceLanguage}
@@ -264,6 +401,34 @@ const server = http.createServer(async (req, res) => {
           translatedText: r0.translations[0].text,
           detectedSourceLanguage:
             (r0.detectedLanguage && r0.detectedLanguage.language) || source || '',
+        };
+      } else if (provider === 'deepl') {
+        if (!DEEPL_API_KEY) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'DEEPL_API_KEY 가 설정되지 않았습니다.' }));
+        }
+        const dBody = { text: [text], target_lang: _deeplLang(target, true) };
+        const ds = _deeplLang(source, false);
+        if (ds) dBody.source_lang = ds;
+        const dRes = await fetch(`${DEEPL_ENDPOINT}/v2/translate`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `DeepL-Auth-Key ${DEEPL_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(dBody),
+        });
+        const dJson = await dRes.json();
+        if (!dRes.ok) {
+          const msg = dJson && dJson.message ? dJson.message : `DeepL 오류 (${dRes.status})`;
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: msg }));
+        }
+        const d0 = dJson.translations[0];
+        out = {
+          translatedText: d0.text,
+          detectedSourceLanguage:
+            (d0.detected_source_language || source || '').toLowerCase(),
         };
       } else {
         if (!GOOGLE_TRANSLATE_API_KEY) {
@@ -639,10 +804,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // 브랜드 구분용 appId(패키지명)를 참가자 메타데이터에 심어, LiveKit 웹훅에서
+    // 브랜드별 사용량을 집계할 수 있게 한다(앱은 이미 ?appId= 로 보냄).
+    const appId = (url.searchParams.get('appId') || '').toString();
     const at = new AccessToken(API_KEY, API_SECRET, {
       identity: identity,
       name: name,
       ttl: '2h',
+      metadata: JSON.stringify({ appId }),
     });
     at.addGrant({
       roomJoin: true,
@@ -704,5 +873,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  기본 엔진   = ${TRANSLATE_PROVIDER}`);
   console.log(`  FCM(통화)   = ${fbMessaging ? 'yes' : 'NO (/call 비활성 — FIREBASE_SERVICE_ACCOUNT 필요)'}`);
   console.log(`  VoIP(iOS)   = ${apnProviders ? `yes (topic ${APNS_BUNDLE_ID}.voip; prod키=${apnProviders.prod ? 'Y' : 'N'} dev키=${apnProviders.sandbox ? 'Y' : 'N'})` : 'NO (APNS_KEY_P8/KEY_ID/TEAM_ID 필요 — iOS 꺼진앱 수신 불가)'}`);
-  console.log(`  엔드포인트  = GET /token  |  POST /translate  |  POST /call {callId,toUuid,room,video}`);
+  console.log(`  사용량 집계 = ${fbFirestore ? 'yes (POST /livekit-webhook, GET /usage)' : 'NO (Firestore 없음)'}`);
+  console.log(`  사용량 알림 = ${USAGE_ALERT_MINUTES ? `${USAGE_ALERT_MINUTES}분 기준 80/100%${ALERT_WEBHOOK_URL ? '' : ' (ALERT_WEBHOOK_URL 없음 → 로그만)'}` : 'off'}`);
+  console.log(`  엔드포인트  = GET /token | POST /translate | POST /call | POST /livekit-webhook | GET /usage`);
 });
