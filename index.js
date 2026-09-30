@@ -218,6 +218,23 @@ function usageMonthKey(d) {
 }
 // Firestore 필드명엔 '.' 등을 못 쓰므로 브랜드(패키지명)의 특수문자를 '_'로.
 function fsKey(s) { return (s || 'unknown').replace(/[.#$/[\]]/g, '_'); }
+// Firestore Timestamp/유닉스초 → 초.
+function tsSec(ts) {
+  if (ts == null) return null;
+  if (typeof ts === 'number') return ts;
+  if (typeof ts === 'bigint') return Number(ts);
+  return ts.seconds != null ? Number(ts.seconds)
+    : (ts._seconds != null ? Number(ts._seconds) : null);
+}
+// 유닉스초 → 'YYYY-MM-DD HH:MM:SS' (KST, UTC+9).
+function fmtKst(sec) {
+  sec = tsSec(sec);
+  if (!sec) return null;
+  const k = new Date(sec * 1000 + 9 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${k.getUTCFullYear()}-${p(k.getUTCMonth() + 1)}-${p(k.getUTCDate())} `
+    + `${p(k.getUTCHours())}:${p(k.getUTCMinutes())}:${p(k.getUTCSeconds())}`;
+}
 
 async function sendUsageAlert(subject, text) {
   console.log('[USAGE ALERT]', subject, '-', text);
@@ -231,7 +248,7 @@ async function sendUsageAlert(subject, text) {
   } catch (e) { console.log('alert send failed:', e && e.message ? e.message : e); }
 }
 
-async function addUsage(brand, minutes) {
+async function addUsage(brand, minutes, roomName) {
   if (!fbFirestore || !(minutes > 0)) return;
   const admin = require('firebase-admin');
   const mk = usageMonthKey();
@@ -243,6 +260,19 @@ async function addUsage(brand, minutes) {
     brands: { [fsKey(brand)]: inc },
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }, { merge: true });
+
+  // 최근 사용 방 기록(방 이름별 누적 + 마지막 사용시각). /usage 에서 최근 5개 조회.
+  if (roomName) {
+    try {
+      const rref = fbFirestore.collection('lkRooms').doc(roomName.replace(/[/#?[\]]/g, '_'));
+      await rref.set({
+        name: roomName,
+        brand: brand || 'unknown',
+        minutes: inc,
+        lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } catch (e) { console.log('room log failed:', e && e.message ? e.message : e); }
+  }
 
   if (USAGE_ALERT_MINUTES > 0) {
     try {
@@ -276,7 +306,8 @@ async function handleLkWebhookEvent(event) {
   minutes = Math.round(minutes * 100) / 100;
   let brand = '';
   try { brand = JSON.parse(p.metadata || '{}').appId || ''; } catch (_) {}
-  await addUsage(brand, minutes);
+  const roomName = (event.room && event.room.name) || '';
+  await addUsage(brand, minutes, roomName);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -312,7 +343,9 @@ const server = http.createServer(async (req, res) => {
     return res.end('ok');
   }
 
-  // 사용량 조회: GET /usage[?month=YYYY-MM] → { month, total, brands:{패키지명:분} }
+  // 사용량 조회: GET /usage[?month=YYYY-MM]
+  //   { month, total, brands:{패키지명:분}, updatedAt(원본), updatedAtText(KST 문자열),
+  //     recentRooms:[{name,brand,minutes,lastSeen}] (최근 5개) }
   if (url.pathname === '/usage') {
     if (ADMIN_KEY) {
       const k = (req.headers['x-admin-key'] ||
@@ -324,10 +357,22 @@ const server = http.createServer(async (req, res) => {
     }
     const mk = (url.searchParams.get('month') || usageMonthKey()).toString();
     let data = {};
+    let recentRooms = [];
     try {
       if (fbFirestore) {
         const snap = await fbFirestore.collection('lkUsage').doc(mk).get();
         data = snap.exists ? snap.data() : {};
+        const rs = await fbFirestore.collection('lkRooms')
+          .orderBy('lastSeenAt', 'desc').limit(5).get();
+        recentRooms = rs.docs.map((doc) => {
+          const r = doc.data();
+          return {
+            name: r.name,
+            brand: r.brand,
+            minutes: Math.round((Number(r.minutes) || 0) * 100) / 100,
+            lastSeen: fmtKst(r.lastSeenAt),
+          };
+        });
       }
     } catch (e) { console.log('usage read error:', e && e.message ? e.message : e); }
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -335,7 +380,36 @@ const server = http.createServer(async (req, res) => {
       month: mk,
       alertLimitMinutes: USAGE_ALERT_MINUTES || null,
       ...data,
+      updatedAtText: fmtKst(data.updatedAt),
+      recentRooms,
     }));
+  }
+
+  // 현재 활성 방(시작됐고 아직 종료 안 된 방) — LiveKit 실시간 조회.
+  // GET /rooms → { active, rooms:[{name, participants, publishers, createdAt}] }
+  if (url.pathname === '/rooms') {
+    if (ADMIN_KEY) {
+      const k = (req.headers['x-admin-key'] ||
+        url.searchParams.get('key') || '').toString();
+      if (k !== ADMIN_KEY) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'forbidden' }));
+      }
+    }
+    try {
+      const rooms = await roomSvc.listRooms();
+      const list = rooms.map((r) => ({
+        name: r.name,
+        participants: Number(r.numParticipants || 0),
+        publishers: Number(r.numPublishers || 0),
+        createdAt: fmtKst(r.creationTime),
+      })).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ active: list.length, rooms: list }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: String(e && e.message ? e.message : e) }));
+    }
   }
 
   // 채팅 번역: POST /translate  body={text, target, source?} → {translatedText, detectedSourceLanguage}
@@ -877,5 +951,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  VoIP(iOS)   = ${apnProviders ? `yes (topic ${APNS_BUNDLE_ID}.voip; prod키=${apnProviders.prod ? 'Y' : 'N'} dev키=${apnProviders.sandbox ? 'Y' : 'N'})` : 'NO (APNS_KEY_P8/KEY_ID/TEAM_ID 필요 — iOS 꺼진앱 수신 불가)'}`);
   console.log(`  사용량 집계 = ${fbFirestore ? 'yes (POST /livekit-webhook, GET /usage)' : 'NO (Firestore 없음)'}`);
   console.log(`  사용량 알림 = ${USAGE_ALERT_MINUTES ? `${USAGE_ALERT_MINUTES}분 기준 80/100%${ALERT_WEBHOOK_URL ? '' : ' (ALERT_WEBHOOK_URL 없음 → 로그만)'}` : 'off'}`);
-  console.log(`  엔드포인트  = GET /token | POST /translate | POST /call | POST /livekit-webhook | GET /usage`);
+  console.log(`  엔드포인트  = GET /token | POST /translate | POST /call | POST /livekit-webhook | GET /usage | GET /rooms`);
 });
