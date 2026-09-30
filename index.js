@@ -386,7 +386,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 현재 활성 방(시작됐고 아직 종료 안 된 방) — LiveKit 실시간 조회.
-  // GET /rooms → { active, rooms:[{name, participants, publishers, createdAt}] }
+  // GET /rooms            → { active, rooms:[{name, participants, publishers, createdAt}] }
+  // GET /rooms?detail=1   → 각 방에 members:[{identity, name, publishing}] 포함
+  //   publishing=true 면 영상/음성 송출 중(카메라·발표자), false 면 시청만(구독자).
   if (url.pathname === '/rooms') {
     if (ADMIN_KEY) {
       const k = (req.headers['x-admin-key'] ||
@@ -396,14 +398,30 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: 'forbidden' }));
       }
     }
+    const detail = url.searchParams.get('detail') === '1';
     try {
       const rooms = await roomSvc.listRooms();
-      const list = rooms.map((r) => ({
-        name: r.name,
-        participants: Number(r.numParticipants || 0),
-        publishers: Number(r.numPublishers || 0),
-        createdAt: fmtKst(r.creationTime),
-      })).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      const list = [];
+      for (const r of rooms) {
+        const item = {
+          name: r.name,
+          participants: Number(r.numParticipants || 0),
+          publishers: Number(r.numPublishers || 0),
+          createdAt: fmtKst(r.creationTime),
+        };
+        if (detail) {
+          try {
+            const parts = await roomSvc.listParticipants(r.name);
+            item.members = parts.map((p) => ({
+              identity: p.identity,
+              name: p.name || '',
+              publishing: (p.tracks && p.tracks.length > 0),
+            }));
+          } catch (_) { item.members = []; }
+        }
+        list.push(item);
+      }
+      list.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ active: list.length, rooms: list }));
     } catch (e) {
