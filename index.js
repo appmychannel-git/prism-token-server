@@ -226,6 +226,21 @@ function tsSec(ts) {
   return ts.seconds != null ? Number(ts.seconds)
     : (ts._seconds != null ? Number(ts._seconds) : null);
 }
+// appId(패키지명)·방이름 → { appId, brand(한글명), type(미팅/CCTV/통화) }.
+const BRAND_NAMES = {
+  gbled: '글로벌', viewplus: '뷰플러스', freedom: 'Freedom', prism: '프리즘',
+  mychannel: '마이채널', ecoglow: 'ECO GLOW',
+};
+function brandInfo(appId, roomName) {
+  const app = appId || '';
+  let type = '미팅';
+  if (app.includes('.cctv.')) type = 'CCTV';
+  else if (app.includes('.meeting.')) type = '미팅';
+  else if ((roomName || '').startsWith('cctv-')) type = 'CCTV';
+  else if ((roomName || '').startsWith('dm-')) type = '통화';
+  const key = app ? app.split('.').pop() : '';
+  return { appId: app || null, brand: BRAND_NAMES[key] || key || null, type };
+}
 // 유닉스초 → 'YYYY-MM-DD HH:MM:SS' (KST, UTC+9).
 function fmtKst(sec) {
   sec = tsSec(sec);
@@ -403,22 +418,32 @@ const server = http.createServer(async (req, res) => {
       const rooms = await roomSvc.listRooms();
       const list = [];
       for (const r of rooms) {
+        // 참가자를 조회해 브랜드(appId)와 봇 외 실인원을 파악.
+        let members = [], appId = '', realCount = 0;
+        try {
+          const parts = await roomSvc.listParticipants(r.name);
+          for (const p of parts) {
+            const publishing = (p.tracks && p.tracks.length > 0);
+            members.push({ identity: p.identity, name: p.name || '', publishing });
+            if (p.identity === 'captions-bot' || (p.identity || '').startsWith('EG_')) continue;
+            realCount += 1;
+            if (!appId) {
+              try { const m = JSON.parse(p.metadata || '{}'); if (m.appId) appId = m.appId; } catch (_) {}
+            }
+          }
+        } catch (_) {}
+        const bi = brandInfo(appId, r.name);
         const item = {
           name: r.name,
+          brand: bi.brand,
+          type: bi.type,
+          appId: bi.appId,
           participants: Number(r.numParticipants || 0),
+          realParticipants: realCount,   // 봇/녹화 제외 실제 인원
           publishers: Number(r.numPublishers || 0),
           createdAt: fmtKst(r.creationTime),
         };
-        if (detail) {
-          try {
-            const parts = await roomSvc.listParticipants(r.name);
-            item.members = parts.map((p) => ({
-              identity: p.identity,
-              name: p.name || '',
-              publishing: (p.tracks && p.tracks.length > 0),
-            }));
-          } catch (_) { item.members = []; }
-        }
+        if (detail) item.members = members;
         list.push(item);
       }
       list.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
