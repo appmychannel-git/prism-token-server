@@ -307,10 +307,39 @@ async function addUsage(brand, minutes, roomName) {
   }
 }
 
+// 방장이 방을 나가면(정상 종료 버튼 없이 브라우저 탭만 닫아도) 방을 삭제한다.
+// → LiveKit이 남은 참가자를 RoomDeleted 로 끊어, 정상 종료와 동일한 "방 종료" 팝업이 뜬다.
+// (CCTV 방은 방장 개념이 없어 제외)
+async function maybeCloseOnHostLeave(event, p) {
+  const room = event.room;
+  const name = room && room.name;
+  if (!name || name.startsWith('cctv-')) return;
+  if (p.identity === 'captions-bot' || (p.identity || '').startsWith('EG_')) return;
+  let host = '';
+  try { host = JSON.parse((room && room.metadata) || '{}').host || ''; } catch (_) {}
+  if (!host) {
+    try {
+      const f = await roomSvc.listRooms([name]);
+      if (f && f[0]) host = JSON.parse(f[0].metadata || '{}').host || '';
+    } catch (_) {}
+  }
+  if (host && p.identity === host) {
+    try {
+      await roomSvc.deleteRoom(name);
+      markEnded(name, host);   // 방장이 잠시 뒤 같은 이름으로 재생성 가능하게 예약
+      console.log('host left (탭 닫힘 등) → room closed:', name);
+    } catch (e) {
+      console.log('deleteRoom on host-left failed:', e && e.message ? e.message : e);
+    }
+  }
+}
+
 async function handleLkWebhookEvent(event) {
   if (!event || event.event !== 'participant_left') return;
   const p = event.participant;
   if (!p || !p.identity) return;
+  // 방장이 나가면 방 종료(탭 닫기 포함). 사용량 집계와 별개로 항상 확인.
+  await maybeCloseOnHostLeave(event, p);
   // 자막봇/녹화(egress)는 사용자 사용량이 아니므로 제외.
   if (p.identity === 'captions-bot' || p.identity.startsWith('EG_')) return;
   const joinedAt = Number(p.joinedAt || 0);                       // unix 초
