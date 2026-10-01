@@ -309,7 +309,10 @@ async function addUsage(brand, minutes, roomName) {
 
 // 방장이 방을 나가면(정상 종료 버튼 없이 브라우저 탭만 닫아도) 방을 삭제한다.
 // → LiveKit이 남은 참가자를 RoomDeleted 로 끊어, 정상 종료와 동일한 "방 종료" 팝업이 뜬다.
+// 단, 순간 네트워크 끊김으로 participant_left 가 떠도 방장이 곧 재접속할 수 있으므로
+// 유예시간(HOST_LEAVE_GRACE_SEC) 뒤 재확인해 방장이 여전히 없을 때만 삭제한다.
 // (CCTV 방은 방장 개념이 없어 제외)
+const HOST_LEAVE_GRACE_SEC = Number(process.env.HOST_LEAVE_GRACE_SEC || 20);
 async function maybeCloseOnHostLeave(event, p) {
   const room = event.room;
   const name = room && room.name;
@@ -323,15 +326,24 @@ async function maybeCloseOnHostLeave(event, p) {
       if (f && f[0]) host = JSON.parse(f[0].metadata || '{}').host || '';
     } catch (_) {}
   }
-  if (host && p.identity === host) {
+  if (!host || p.identity !== host) return;
+
+  // 유예 후 재확인: 방장이 돌아왔으면 유지, 여전히 없으면 종료.
+  setTimeout(async () => {
     try {
+      const parts = await roomSvc.listParticipants(name);  // 방 없으면 throw → 이미 종료됨
+      const hostBack = parts.some((pp) => pp.identity === host);
+      if (hostBack) {
+        console.log('host 재접속 → 방 유지:', name);
+        return;
+      }
       await roomSvc.deleteRoom(name);
       markEnded(name, host);   // 방장이 잠시 뒤 같은 이름으로 재생성 가능하게 예약
       console.log('host left (탭 닫힘 등) → room closed:', name);
     } catch (e) {
-      console.log('deleteRoom on host-left failed:', e && e.message ? e.message : e);
+      console.log('host-left 재확인/삭제 생략:', e && e.message ? e.message : e);
     }
-  }
+  }, HOST_LEAVE_GRACE_SEC * 1000);
 }
 
 async function handleLkWebhookEvent(event) {
