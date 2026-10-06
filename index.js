@@ -90,8 +90,8 @@ function readBody(req) {
 const recentlyEnded = new Map();
 
 // 비밀번호(pin) 무차별 대입 방지: 방+IP 기준으로 실패 누적 시 일시 잠금.
-const PIN_MAX_FAILS = Number(process.env.PIN_MAX_FAILS || 5);
-const PIN_LOCK_SEC = Number(process.env.PIN_LOCK_SEC || 300); // 5분
+const PIN_MAX_FAILS = Number(process.env.PIN_MAX_FAILS || 10);
+const PIN_LOCK_SEC = Number(process.env.PIN_LOCK_SEC || 120); // 2분
 const pinAttempts = new Map(); // `${room}|${ip}` -> { fails, lockUntil(초) }
 function clientIp(req) {
   const xff = (req.headers['x-forwarded-for'] || '').toString();
@@ -896,23 +896,42 @@ const server = http.createServer(async (req, res) => {
         const now = Math.floor(Date.now() / 1000);
         const akey = `${room}|${clientIp(req)}`;
         const rec = pinAttempts.get(akey) || { fails: 0, lockUntil: 0 };
-        // 잠금 중이면 거부.
+        // 잠금 중이면 거부(남은 시간 안내 + Retry-After).
         if (rec.lockUntil > now) {
-          res.writeHead(429, { 'Content-Type': 'application/json' });
+          const remain = rec.lockUntil - now;
+          res.writeHead(429, {
+            'Content-Type': 'application/json',
+            'Retry-After': String(remain),
+          });
           return res.end(JSON.stringify({
-            error: '비밀번호 시도가 많습니다. 잠시 후 다시 시도하세요.',
+            error: `비밀번호를 여러 번 틀려 입장이 제한됐습니다. 약 ${Math.ceil(remain / 60)}분 후 다시 시도해 주세요.`,
           }));
         }
         if (!pin || pin !== meta.pin) {
           rec.fails += 1;
+          let locked = false;
           if (rec.fails >= PIN_MAX_FAILS) {
             rec.lockUntil = now + PIN_LOCK_SEC;
             rec.fails = 0;
+            locked = true;
           }
           pinAttempts.set(akey, rec);
+          // 이번 실패로 잠금에 도달한 경우: 잠금 안내(429).
+          if (locked) {
+            res.writeHead(429, {
+              'Content-Type': 'application/json',
+              'Retry-After': String(PIN_LOCK_SEC),
+            });
+            return res.end(JSON.stringify({
+              error: `비밀번호를 ${PIN_MAX_FAILS}번 틀려 ${Math.ceil(PIN_LOCK_SEC / 60)}분간 입장이 제한됩니다. 잠시 후 다시 시도해 주세요.`,
+            }));
+          }
+          // 아직 여유가 있으면: 남은 시도 횟수 안내(403).
+          const left = PIN_MAX_FAILS - rec.fails;
           res.writeHead(403, { 'Content-Type': 'application/json' });
-          return res.end(
-            JSON.stringify({ error: '입장 코드가 올바르지 않습니다.' }));
+          return res.end(JSON.stringify({
+            error: `입장 코드가 올바르지 않습니다. (남은 시도 ${left}회)`,
+          }));
         }
         pinAttempts.delete(akey); // 성공 시 실패 카운트 리셋
       }
