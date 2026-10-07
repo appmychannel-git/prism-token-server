@@ -869,6 +869,12 @@ const server = http.createServer(async (req, res) => {
   // dm(1:1 통화)·cctv 방은 여러 당사자가 공유하는 방 → 중복 생성/예약 검사 제외.
   const isShareRoom = room.startsWith('dm-') || room.startsWith('cctv-');
   const isCctv = room.startsWith('cctv-');
+  // CCTV 호스트가 보내는 "활성 그룹 비번 집합"(쉼표 구분). 있으면 이 집합 전체가
+  // 그 방의 유효 비번(그룹별 비번 여러 개). 없으면 단일 X-Room-Pin(통화/기존 호환).
+  const pinsHeader = (req.headers['x-room-pins'] || '').toString().trim();
+  const pinsSet = pinsHeader
+    ? pinsHeader.split(',').map((s) => s.trim()).filter(Boolean)
+    : [];
 
   // ---- 방 존재 확인 + 비공개(입장코드) 검증 ----
   // 코드는 LiveKit 방 메타데이터에 저장(별도 DB 불필요).
@@ -877,7 +883,29 @@ const server = http.createServer(async (req, res) => {
   //  - 방 없음 + 참여하기 → 거부(없는 방 입장/자동생성 방지)
   try {
     const found = await roomSvc.listRooms([room]);
-    const existing = found && found[0];
+    let existing = found && found[0];
+
+    // CCTV 카메라 호스트(identity 'cam-')가 create 로 접속하며 비번을 "바꾼" 경우:
+    // 기존 방은 옛 비번을 메타데이터에 갖고 있어 새 비번과 불일치로 거절된다.
+    // 호스트는 자기 방 비번의 주인이므로, 기존 방을 지우고 새 비번으로 재생성한다.
+    // (기존 코드로 접속해 있던 시청자는 끊기고 새 비번으로 재접속해야 함 = 의도한 동작)
+    // 비번이 같으면(원격 켜기·일반 재접속) 이 분기를 타지 않아 시청자가 끊기지 않는다.
+    if (existing && isCctv && isCreate && identity.startsWith('cam-') &&
+        (pinsSet.length || pin)) {
+      let m = {};
+      try { m = JSON.parse(existing.metadata || '{}'); } catch (_) {}
+      const curSet = Array.isArray(m.pins) && m.pins.length
+        ? m.pins.slice()
+        : (m.pin ? [m.pin] : []);
+      const newSet = pinsSet.length ? pinsSet.slice() : (pin ? [pin] : []);
+      // 유효 비번 집합이 바뀌었으면(그룹 추가/삭제/비번변경) 기존 방 삭제 후 재생성.
+      const changed =
+        newSet.slice().sort().join(',') !== curSet.sort().join(',');
+      if (changed) {
+        try { await roomSvc.deleteRoom(room); } catch (_) {}
+        existing = null; // 아래 "방 없음 + create" 경로로 → 새 집합으로 재생성
+      }
+    }
 
     if (existing) {
       // 만들기(create)인데 같은 이름의 방이 이미 있으면 → 이름 중복 거부.
@@ -893,6 +921,10 @@ const server = http.createServer(async (req, res) => {
       let meta = {};
       try { meta = JSON.parse(existing.metadata || '{}'); } catch (_) {}
       if (meta.private) {
+        // 유효 비번 집합(그룹별 비번 여러 개) — 없으면 단일 meta.pin.
+        const validPins = Array.isArray(meta.pins) && meta.pins.length
+          ? meta.pins
+          : (meta.pin ? [meta.pin] : []);
         const now = Math.floor(Date.now() / 1000);
         const akey = `${room}|${clientIp(req)}`;
         const rec = pinAttempts.get(akey) || { fails: 0, lockUntil: 0 };
@@ -907,7 +939,7 @@ const server = http.createServer(async (req, res) => {
             error: `비밀번호를 여러 번 틀려 입장이 제한됐습니다. 약 ${Math.ceil(remain / 60)}분 후 다시 시도해 주세요.`,
           }));
         }
-        if (!pin || pin !== meta.pin) {
+        if (!pin || !validPins.includes(pin)) {
           rec.fails += 1;
           let locked = false;
           if (rec.fails >= PIN_MAX_FAILS) {
@@ -962,7 +994,15 @@ const server = http.createServer(async (req, res) => {
         // createdAt + maxDurationSec: 최대 유지시간 초과 시 sweeper가 자동 종료.
         const meta = { host: identity, createdAt: now };
         if (maxSec > 0) meta.maxDurationSec = maxSec;
-        if (pin) { meta.private = true; meta.pin = pin; }
+        // 비번 집합(그룹별 여러 개)이 오면 그 전체를 유효 비번으로 저장. 없으면 단일 pin.
+        if (pinsSet.length) {
+          meta.private = true;
+          meta.pins = pinsSet;
+          meta.pin = pinsSet[0]; // 하위호환(단일 pin 참조 코드용)
+        } else if (pin) {
+          meta.private = true;
+          meta.pin = pin;
+        }
         await roomSvc.createRoom({
           name: room,
           emptyTimeout: EMPTY_SEC, // 아무도 안 들어오면 이 시간 뒤 삭제
