@@ -792,6 +792,127 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // CCTV 기기 이름 조회: GET /cctv-name?code=<code> → { name }
+  // 클라이언트는 Firestore cctvCameras 를 직접 못 읽으므로(규칙상 서버만) 서버가 대신 조회.
+  if (url.pathname === '/cctv-name') {
+    const code = (url.searchParams.get('code') || '').toString().trim();
+    let name = '';
+    if (code && fbFirestore) {
+      try {
+        const d = await fbFirestore.collection('cctvCameras').doc(code).get();
+        if (d.exists) name = (d.get('name') || '').toString();
+      } catch (_) {}
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ name }));
+  }
+
+  // CCTV 시청자 등록: POST /cctv-viewer  body={code, uuid, name}
+  // 시청자가 CCTV를 추가/시청하면 호스트의 "친구목록"에 보이도록 등록(차단값은 보존).
+  if (url.pathname === '/cctv-viewer') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'POST 로 호출하세요.' }));
+    }
+    if (!fbFirestore) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Firestore 미설정.' }));
+    }
+    let body = {};
+    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '잘못된 요청 본문(JSON) 입니다.' }));
+    }
+    const code = (body.code || '').toString().trim();
+    const uuid = (body.uuid || '').toString().trim();
+    const name = (body.name || '').toString().trim();
+    if (!code || !uuid) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'code, uuid 는 필수입니다.' }));
+    }
+    try {
+      const admin = require('firebase-admin');
+      const ref = fbFirestore.collection('cctvViewers').doc(`${code}__${uuid}`);
+      await ref.set({
+        code, uuid, name,
+        lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true }); // blocked 는 건드리지 않음(보존)
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: String(e) }));
+    }
+  }
+
+  // CCTV 시청자 목록: GET /cctv-viewers?code=<code> → { viewers:[{uuid,name,blocked}] }
+  // (호스트가 자기 코드로 조회 — 코드가 비밀값인 신뢰 모델)
+  if (url.pathname === '/cctv-viewers') {
+    const code = (url.searchParams.get('code') || '').toString().trim();
+    if (!code || !fbFirestore) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ viewers: [] }));
+    }
+    try {
+      const q = await fbFirestore.collection('cctvViewers')
+        .where('code', '==', code).get();
+      const viewers = q.docs.map((d) => {
+        const m = d.data() || {};
+        return {
+          uuid: (m.uuid || '').toString(),
+          name: (m.name || '').toString(),
+          blocked: m.blocked === true,
+          lastSeen: fmtKst(m.lastSeen),
+        };
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ viewers }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: String(e) }));
+    }
+  }
+
+  // CCTV 시청자 차단/해제: POST /cctv-block  body={code, uuid, blocked}
+  // 차단되면 그 기기(viewer-<uuid>)는 이후 /token 에서 거부돼 입장 불가.
+  if (url.pathname === '/cctv-block') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'POST 로 호출하세요.' }));
+    }
+    if (!fbFirestore) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Firestore 미설정.' }));
+    }
+    let body = {};
+    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '잘못된 요청 본문(JSON) 입니다.' }));
+    }
+    const code = (body.code || '').toString().trim();
+    const uuid = (body.uuid || '').toString().trim();
+    const blocked = body.blocked === true || body.blocked === 'true';
+    if (!code || !uuid) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'code, uuid 는 필수입니다.' }));
+    }
+    try {
+      const ref = fbFirestore.collection('cctvViewers').doc(`${code}__${uuid}`);
+      await ref.set({ code, uuid, blocked }, { merge: true });
+      // 차단 시 현재 접속 중인 그 시청자도 즉시 퇴장(가능하면).
+      if (blocked) {
+        try {
+          await roomSvc.removeParticipant(`cctv-${code}`, `viewer-${uuid}`);
+        } catch (_) {}
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: String(e) }));
+    }
+  }
+
   // 통화 벨: POST /call  body={callId, fromUuid, fromName, toUuid, room, video}
   // 상대(toUuid) 기기 FCM 토큰을 Firestore(devices/{uuid})에서 읽어 수신 푸시를 보낸다.
   if (url.pathname === '/call') {
@@ -925,6 +1046,23 @@ const server = http.createServer(async (req, res) => {
   const pinsSet = pinsHeader
     ? pinsHeader.split(',').map((s) => s.trim()).filter(Boolean)
     : [];
+
+  // CCTV 시청자 차단 검사: 호스트가 차단한 기기(viewer-<uuid>)는 입장 거부.
+  // (차단 정보는 Firestore cctvViewers/{code}__{uuid}.blocked — 서버 Admin 조회)
+  if (isCctv && fbFirestore && identity.startsWith('viewer-')) {
+    const vuuid = identity.slice('viewer-'.length);
+    const ccode = room.slice('cctv-'.length);
+    if (vuuid && ccode) {
+      try {
+        const vs = await fbFirestore.collection('cctvViewers')
+          .doc(`${ccode}__${vuuid}`).get();
+        if (vs.exists && vs.get('blocked') === true) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: '차단된 기기입니다.' }));
+        }
+      } catch (_) {}
+    }
+  }
 
   // ---- 방 존재 확인 + 비공개(입장코드) 검증 ----
   // 코드는 LiveKit 방 메타데이터에 저장(별도 DB 불필요).
@@ -1144,5 +1282,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  VoIP(iOS)   = ${apnProviders ? `yes (topic ${APNS_BUNDLE_ID}.voip; prod키=${apnProviders.prod ? 'Y' : 'N'} dev키=${apnProviders.sandbox ? 'Y' : 'N'})` : 'NO (APNS_KEY_P8/KEY_ID/TEAM_ID 필요 — iOS 꺼진앱 수신 불가)'}`);
   console.log(`  사용량 집계 = ${fbFirestore ? 'yes (POST /livekit-webhook, GET /usage)' : 'NO (Firestore 없음)'}`);
   console.log(`  사용량 알림 = ${USAGE_ALERT_MINUTES ? `${USAGE_ALERT_MINUTES}분 기준 80/100%${ALERT_WEBHOOK_URL ? '' : ' (ALERT_WEBHOOK_URL 없음 → 로그만)'}` : 'off'}`);
-  console.log(`  엔드포인트  = GET /token | POST /translate | POST /call | POST /cctv-wake | POST /cctv-pins | POST /livekit-webhook | GET /usage | GET /rooms`);
+  console.log(`  엔드포인트  = GET /token | POST /translate | POST /call | POST /cctv-wake | POST /cctv-pins | GET /cctv-name | POST /cctv-viewer | GET /cctv-viewers | POST /cctv-block | POST /livekit-webhook | GET /usage | GET /rooms`);
 });
