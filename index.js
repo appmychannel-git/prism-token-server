@@ -742,6 +742,56 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // CCTV 공유 비번(그룹) 즉시 반영: POST /cctv-pins  body={code, pins:[...]}
+  // 송출 중이거나 방이 잔존(emptyTimeout)하는 동안 그룹 토글/삭제/비번변경을
+  // 방 삭제 없이 메타데이터만 갱신해 바로 적용한다(새 시청자부터 유효). 방이 없으면 noop.
+  // ⚠️ 인증 없음(기기 코드 자체가 비밀 — /cctv-wake 와 동일한 신뢰 모델).
+  if (url.pathname === '/cctv-pins') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'POST 로 호출하세요.' }));
+    }
+    let body = {};
+    try {
+      body = JSON.parse((await readBody(req)) || '{}');
+    } catch (_) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '잘못된 요청 본문(JSON) 입니다.' }));
+    }
+    const code = (body.code || '').toString().trim();
+    if (!code) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'code 는 필수입니다.' }));
+    }
+    const pins = Array.isArray(body.pins)
+      ? body.pins.map((p) => String(p).trim()).filter(Boolean)
+      : [];
+    const room = `cctv-${code}`;
+    try {
+      const found = await roomSvc.listRooms([room]);
+      const existing = found && found[0];
+      if (!existing) {
+        // 방이 없으면 갱신할 대상이 없음 — 다음 송출 때 카메라가 지정한다.
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: true, note: 'no room' }));
+      }
+      let meta = {};
+      try { meta = JSON.parse(existing.metadata || '{}'); } catch (_) {}
+      if (pins.length) {
+        meta.private = true;
+        meta.pins = pins;
+        meta.pin = pins[0]; // 하위호환(단일 pin 참조)
+      }
+      // pins 가 비면(이론상 없음 — 기본 그룹 항상 포함) 기존 비번 유지.
+      await roomSvc.updateRoomMetadata(room, JSON.stringify(meta));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, pins: meta.pins || [] }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'pins 갱신 실패: ' + String(e) }));
+    }
+  }
+
   // 통화 벨: POST /call  body={callId, fromUuid, fromName, toUuid, room, video}
   // 상대(toUuid) 기기 FCM 토큰을 Firestore(devices/{uuid})에서 읽어 수신 푸시를 보낸다.
   if (url.pathname === '/call') {
@@ -1094,5 +1144,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  VoIP(iOS)   = ${apnProviders ? `yes (topic ${APNS_BUNDLE_ID}.voip; prod키=${apnProviders.prod ? 'Y' : 'N'} dev키=${apnProviders.sandbox ? 'Y' : 'N'})` : 'NO (APNS_KEY_P8/KEY_ID/TEAM_ID 필요 — iOS 꺼진앱 수신 불가)'}`);
   console.log(`  사용량 집계 = ${fbFirestore ? 'yes (POST /livekit-webhook, GET /usage)' : 'NO (Firestore 없음)'}`);
   console.log(`  사용량 알림 = ${USAGE_ALERT_MINUTES ? `${USAGE_ALERT_MINUTES}분 기준 80/100%${ALERT_WEBHOOK_URL ? '' : ' (ALERT_WEBHOOK_URL 없음 → 로그만)'}` : 'off'}`);
-  console.log(`  엔드포인트  = GET /token | POST /translate | POST /call | POST /livekit-webhook | GET /usage | GET /rooms`);
+  console.log(`  엔드포인트  = GET /token | POST /translate | POST /call | POST /cctv-wake | POST /cctv-pins | POST /livekit-webhook | GET /usage | GET /rooms`);
 });
