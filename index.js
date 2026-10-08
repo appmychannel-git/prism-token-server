@@ -708,13 +708,39 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: '잘못된 요청 본문(JSON) 입니다.' }));
     }
     const code = (body.code || '').toString();
+    // 요청자(시청자) 식별·비번 — 깨우기 전에 차단/비번을 검사(불필요한 송출 켜짐 방지).
+    const reqUuid = (body.uuid || '').toString().trim();
+    const reqPin = (body.pin || '').toString().trim();
     if (!code) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: 'code 는 필수입니다.' }));
     }
+    // ① 차단된 기기면 깨우지 않음(명시적 blocked==true 일 때만 — 데이터 없으면 통과).
+    if (reqUuid) {
+      try {
+        const vs = await fbFirestore.collection('cctvViewers')
+          .doc(`${code}__${reqUuid}`).get();
+        if (vs.exists && vs.get('blocked') === true) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: '차단된 기기입니다.' }));
+        }
+      } catch (_) {}
+    }
     try {
       const cam = await fbFirestore.collection('cctvCameras').doc(code).get();
       const uuid = cam.exists ? cam.get('uuid') : null;
+      // ② 비번 대조: 저장된 유효 비번이 있고 요청 비번이 거기 없으면 깨우지 않음.
+      //    (저장된 비번이 아예 없으면 fail-open — 기존처럼 깨우고 접속 단계에서 걸러짐)
+      if (reqPin) {
+        const storedPins = cam.exists && Array.isArray(cam.get('pins'))
+          ? cam.get('pins') : null;
+        if (storedPins && storedPins.length && !storedPins.includes(reqPin)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({
+            error: '비밀번호가 올바르지 않습니다.',
+          }));
+        }
+      }
       if (!uuid) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
@@ -766,12 +792,25 @@ const server = http.createServer(async (req, res) => {
     const pins = Array.isArray(body.pins)
       ? body.pins.map((p) => String(p).trim()).filter(Boolean)
       : [];
+    const pubName = (body.name || '').toString().trim();
     const room = `cctv-${code}`;
+    // 카메라가 꺼져 있어도(방 없음) 원격 깨우기 때 비번 대조를 할 수 있도록,
+    // 유효 비번(+이름)을 Firestore cctvCameras 에 저장(서버 Admin — 규칙 우회).
+    if (fbFirestore) {
+      try {
+        const admin = require('firebase-admin');
+        const data = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+        if (pins.length) data.pins = pins;
+        if (pubName) data.name = pubName;
+        await fbFirestore.collection('cctvCameras').doc(code)
+          .set(data, { merge: true });
+      } catch (_) {}
+    }
     try {
       const found = await roomSvc.listRooms([room]);
       const existing = found && found[0];
       if (!existing) {
-        // 방이 없으면 갱신할 대상이 없음 — 다음 송출 때 카메라가 지정한다.
+        // 방이 없어도 위에서 Firestore(cctvCameras.pins)는 갱신됨 → 깨우기 검사용.
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: true, note: 'no room' }));
       }
