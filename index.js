@@ -1114,8 +1114,11 @@ const server = http.createServer(async (req, res) => {
 
     // CCTV 카메라 호스트(identity 'cam-')가 create 로 접속하며 비번을 "바꾼" 경우:
     // 기존 방은 옛 비번을 메타데이터에 갖고 있어 새 비번과 불일치로 거절된다.
-    // 호스트는 자기 방 비번의 주인이므로, 기존 방을 지우고 새 비번으로 재생성한다.
-    // (기존 코드로 접속해 있던 시청자는 끊기고 새 비번으로 재접속해야 함 = 의도한 동작)
+    // 호스트는 자기 방 비번의 주인이므로, 기존 방의 메타데이터를 새 비번으로 "교체"한다.
+    // (⚠️ 예전엔 deleteRoom + 재생성했는데, LiveKit 삭제 전파 지연으로 createRoom 이
+    //  기존 방을 그대로 반환해 옛 비번이 남는 레이스가 있었다 — 시청자가 방을 살려둔
+    //  채 비번을 연속 변경하면 재현. 그래서 방을 지우지 않고 updateRoomMetadata 로
+    //  확실히 교체하고, 이전 비번으로 접속해 있던 시청자(viewer-)만 내보낸다.)
     // 비번이 같으면(원격 켜기·일반 재접속) 이 분기를 타지 않아 시청자가 끊기지 않는다.
     if (existing && isCctv && isCreate && identity.startsWith('cam-') &&
         (pinsSet.length || pin)) {
@@ -1125,12 +1128,25 @@ const server = http.createServer(async (req, res) => {
         ? m.pins.slice()
         : (m.pin ? [m.pin] : []);
       const newSet = pinsSet.length ? pinsSet.slice() : (pin ? [pin] : []);
-      // 유효 비번 집합이 바뀌었으면(그룹 추가/삭제/비번변경) 기존 방 삭제 후 재생성.
+      // 유효 비번 집합이 바뀌었으면(비번 변경) 기존 방 메타데이터를 새 집합으로 교체.
       const changed =
         newSet.slice().sort().join(',') !== curSet.sort().join(',');
       if (changed) {
-        try { await roomSvc.deleteRoom(room); } catch (_) {}
-        existing = null; // 아래 "방 없음 + create" 경로로 → 새 집합으로 재생성
+        m.private = true;
+        m.pins = newSet;
+        m.pin = newSet[0]; // 하위호환(단일 pin 참조)
+        const metaStr = JSON.stringify(m);
+        try { await roomSvc.updateRoomMetadata(room, metaStr); } catch (_) {}
+        existing.metadata = metaStr; // 아래 기존-방 검증이 새 비번을 쓰도록 갱신
+        // 이전 비번으로 접속해 있던 시청자는 내보낸다(새 비번으로만 재접속 가능).
+        try {
+          const parts = await roomSvc.listParticipants(room);
+          for (const p of parts) {
+            if ((p.identity || '').startsWith('viewer-')) {
+              try { await roomSvc.removeParticipant(room, p.identity); } catch (_) {}
+            }
+          }
+        } catch (_) {}
       }
     }
 
